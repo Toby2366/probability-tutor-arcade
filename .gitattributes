@@ -13,3 +13,16 @@
 
 *.bin   binary
 *.lpk   binary
+
+# CAD 文件同理：STEP 是文本格式（CRLF），行尾转换会改掉字节，
+# 虽然多数软件能读，但"仓库里的文件和设计师导出的文件不是同一个文件"
+# 这种事不值得冒，一律按原样存。
+*.step   -text
+*.stp    -text
+*.STEP   -text
+*.STP    -text
+*.3mf    binary
+*.3MF    binary
+*.SLDPRT binary
+*.sldprt binary
+*.png    binary
