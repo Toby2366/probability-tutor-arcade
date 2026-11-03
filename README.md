@@ -1,10 +1,12 @@
-# Arcs Mini Arcade · 小聆掌机游戏厅
+# 概率论助教与小游戏 · Arcs Mini3
 
-在 **聆思 Arcs Mini3**（LS2663 + CH32V003 扩展板）的 240×240 圆屏上，用 Lua 写的一套可玩的小游戏与概率教学实验，外加一层让"声音、画面、按键"真正好用的固件增强。
+对着掌机说"掷个骰子"，助教**小概**会先讲两句直觉，再把小游戏直接拉到屏幕上；退出游戏，接着聊概念。
 
-12 个画面、26 组程序化乐谱、一套能在 PC 上跑的无头仿真器。
+一套跑在 **聆思 Arcs Mini3**（240×240 圆屏）上的：语音概率论助教 + 12 个画面的 Lua 小游戏与教学实验，外加一层让"声音、画面、按键"真正好用的固件增强。
 
-> A Lua mini-game collection for the ListenAI Arcs Mini3 handheld (240×240 round LCD), with firmware patches that add a 4-voice synth binding, `app.exit()`, and on-device screen/key/glyph/audio inspection commands.
+> **非官方项目**，与聆思（ListenAI）无隶属关系，仅为适配 Arcs Mini3 平台而开发。
+>
+> An unofficial probability-tutor + mini-game collection for the ListenAI Arcs Mini3 handheld (240×240 round LCD): 12 Lua scenes, 26 procedural SFX scores, and firmware patches adding a 4-voice synth binding, `app.exit()`, and on-device screen/key/glyph/audio inspection commands.
 
 ---
 
@@ -23,16 +25,17 @@
   </tr>
 </table>
 
-> 图为原型机：白色外壳 + 3D 打印扩展板（方向键、功能键、旋钮），杜邦线接到主控排针。
+> 原型机：白色外壳 + 3D 打印扩展板（5 个按键 + 1 个旋钮），杜邦线接到主控排针。
 
 ---
 
 ## 目录
 
 - [效果](#效果)
+- [它是什么](#它是什么)
 - [它能做什么](#它能做什么)
+- [硬件与 BOM](#硬件与-bom)
 - [为什么需要这些固件补丁](#为什么需要这些固件补丁)
-- [硬件与运行环境](#硬件与运行环境)
 - [仓库结构](#仓库结构)
 - [快速开始](#快速开始)
 - [开发与调试](#开发与调试)
@@ -42,9 +45,32 @@
 
 ---
 
-## 它能做什么
+## 它是什么
 
-小应用 `arcade` 启动后是一个游戏大厅，用方向键选择、`→` 进入，板载侧键单击返回上级，在主菜单按侧键退出。
+两半，各自能独立用，合起来才是完整的东西。
+
+### 一半是助教
+
+唤醒后直接问："为什么掷 10 次硬币不一定 5 正 5 反？""高尔顿板为什么会长成钟形？"
+
+- **人设"小概"**：像个爱跟学生打赌的学长，先给一句"直觉版"再展开。不堆公式——这是语音 + 小屏幕场景，长公式既听不清也显示不下。
+- **知识库**：按课程的"知识单元"切分，讲概念时按单元检索。
+- **会动手**：讲到该做实验了，直接把小游戏拉到屏幕上。
+
+| 学生说 | 助教调用 | 屏幕上出现 |
+|---|---|---|
+| 掷个骰子 / 来一局 | `play_dice` | 单颗 d6，滚动动画 + 落点直方图 |
+| 抛硬币 / 看正面频率 | `play_coin` | 正反累计与占比 |
+| 高尔顿板 / 放小球 | `play_galton` | 小球逐个撞钉入槽，堆成直方图 |
+| 打开游戏厅 | `play_arcade` | 5 个游戏的主菜单 |
+| 测一下接线 / 硬件测试 | `play_hwtest` | 按键电平与旋钮读数的实时自检 |
+| 退出 / 回桌面 | `ls.built_in.miniapp_exit` | 回到待机 |
+
+人设与行为规范原文在 [`assistant/`](assistant/)，可以直接改。语音编排层基于聆思官方 voice-chat 模板（不包含在本仓库）；本仓库提供的是**人设 + 小游戏 + 把这 5 个工具接上固件的实现**。
+
+### 另一半是小游戏
+
+不接语音也能独立跑：`miniapp run arcade` 就是一个完整的掌机游戏厅。
 
 ```
 游戏大厅
@@ -61,6 +87,12 @@
 └── 2048              4×4 合并，达成 2048 有专属旋律
 ```
 
+---
+
+## 它能做什么
+
+方向键选择、`→` 进入；板载侧键单击返回上级，在主菜单上则退出小应用。
+
 | 场景 | 操作 | 关键实现 |
 |---|---|---|
 | 贪吃蛇 | ↑↓←→ 转向 | 像素级连续移动（不是整格跳），转向当帧生效；体节按轨迹等距铺开 |
@@ -75,6 +107,35 @@
 - `apps/coin.lua` — 掷硬币，正反累计
 - `apps/galton.lua` — 高尔顿板
 - `apps/hwtest.lua` — 硬件自检：按键电平、旋钮 ADC、屏幕色块
+
+---
+
+## 硬件与 BOM
+
+| 部件 | 型号 / 规格 | 说明 |
+|---|---|---|
+| 主控 | 聆思 Arcs Mini3（LS2663） | 240×240 圆屏、麦克风、扬声器、Wi-Fi |
+| 扩展 IO | CH32V003（I2C 桥） | 提供 `exgpiod` / `exadc`，扩展板经排线接到主控 |
+| 方向键 ×4 | **Risym 大按键模块**：12×12mm 轻触开关 + 大圆帽（黑/红/绿/蓝/黄） | 20×12mm PCB，3Pin `VCC/GND/OUT`，3.3–5V，板载上拉 + 防抖；**高电平有效**（部分版本可跳线选低有效） |
+| 功能键 ×1 | 同上 | 接 `on_button_click("function")`：单击返回 / 退出 |
+| 旋钮 ×1 | **Risym 电子积木 旋转电位器模块**：10kΩ 线性，机械行程 270° | 20×20mm PCB（带 Φ3mm 安装孔），3Pin `GND/VCC/OUT`，输出 0–VCC 模拟电压；10 位 ADC → 1024 级 |
+| 外壳 | 自绘 3D 打印（底座 + 盖） | STEP 文件随后补进 `hardware/` |
+
+**两个模块恰好对上两类接口**：按键给"高/低电平"（数字输入），旋钮给"0 到 VCC 的电压"（ADC 输入）。代码里 `(k - 512) / 512` 把 0..1023 映射到 -1..1，正对应 270° 行程与线性电位器的关系——这也是"旋钮只能读绝对位置、不知道转了几格"的物理原因。
+
+| 信号 | 引脚 |
+|---|---|
+| ↑ | PA0（高有效） |
+| ← | PA1（高有效） |
+| ↓ | PB7（高有效） |
+| → | PB6（高有效） |
+| 旋钮 | PD4 → `exadc` ch7，0..1023 |
+| 屏幕 | 240×240，Lua 侧 `app.width/height = 240` |
+| 字体 | `lv_font_chinese_16.bin`，1bpp，cmap 含 U+2190..U+2199 箭头 |
+| 基础固件 | 聆思 arc SDK `mini-v3.1.0` 分支 |
+| Lua 方言 | 精简 Lua：无 `pcall`，`screen.*` 只收整数 |
+
+---
 
 ## 为什么需要这些固件补丁
 
@@ -92,28 +153,20 @@
 
 补丁共 10 个文件、约 1200 行，全部围绕 `apps/arcs-mini/miniapp/`、`apps/arcs-mini/mcp-tools/` 和 `src/shell/cmd/`。
 
-## 硬件与运行环境
-
-| 项 | 值 |
-|---|---|
-| 主控 | 聆思 LS2663（arcs_mini3 板型） |
-| 协处理器 | CH32V003，经 I2C 桥提供 `exadc` / `exgpiod` |
-| 屏幕 | 240×240 圆屏，Lua 侧 `app.width/height = 240` |
-| 方向键 | PA0=↑ PA1=← PB7=↓ PB6=→（高电平有效） |
-| 侧键 | `on_button_click("function")` |
-| 旋钮 | PD4 → `exadc` ch7，0..1023 |
-| 字体 | `lv_font_chinese_16.bin`，1bpp，cmap 含 U+2190..U+2199 箭头 |
-| 基础固件 | 聆思 arc SDK `mini-v3.1.0` 分支 |
-| Lua 方言 | 精简 Lua：无 `pcall`、无 `string.format` 全量、`screen.*` 只收整数 |
+---
 
 ## 仓库结构
 
 ```
 apps/        可直接装进设备的 Lua 小应用
+assistant/   助教"小概"的人设与行为规范
 tools/       gen_builtin.py（Lua → C 字节数组）、sim_*.cjs（PC 端无头仿真）
 patches/     相对官方 mini-v3.1.0 的固件补丁
-docs/        开发记录、固件改造说明、踩坑记录
+docs/        开发记录、踩坑记录、字体与输入速查
+hardware/    外壳 STEP（随后补充）
 ```
+
+---
 
 ## 快速开始
 
@@ -132,7 +185,7 @@ adb shell miniapp run arcade
 git clone <SDK 仓库地址> arcs_mini && cd arcs_mini
 git checkout mini-v3.1.0
 
-# 2. 打补丁（在本仓库根目录之外的任意位置执行均可）
+# 2. 打补丁
 git apply <本仓库>/patches/0001-miniapp-arcade-runtime.patch
 
 # 3. 把 Lua 源码生成 C 字节数组，直接写进 SDK 的 mcp-tools/
@@ -149,6 +202,12 @@ adb -s BOOT-<serial> shell reboot hard
 ```
 
 > `gen_builtin.py` 默认输出到 `../apps/arcs-mini/mcp-tools`，可用 `--out` 指定。补丁里的 `mcp_tool_miniapp_builtin.c` 会 `#include` 这些生成的头文件，**必须先跑第 3 步再编译**。
+
+### 路线 C：只要助教
+
+把 [`assistant/persona.md`](assistant/persona.md) 与 [`assistant/system-prompt.md`](assistant/system-prompt.md) 的内容贴进聆思平台的"角色配置"和"系统提示词"即可。小游戏工具依赖路线 B 的固件。
+
+---
 
 ## 开发与调试
 
@@ -179,6 +238,8 @@ miniapp audio               合成器遥测：播完段数/音符数/最近时�
 
 `miniapp screen` + `miniapp audio` 的组合，让"画面对不对、声音出没出"都能在 headless 的 ADB 会话里验证，不用盯着屏幕。
 
+---
+
 ## 音效是怎么做的
 
 `apps/arcade.lua` 顶部有一个小音效引擎：把每个音效写成音符表 `N(delay_ms, hz, dur_ms, voice, wave, volume)`，`synth.play` 一次提交整段，避免多次开流互相打断。
@@ -198,16 +259,22 @@ gun = {                       -- 枪声：噪声爆音 + 低频冲击 + 余震
 
 共 26 组乐谱（外加 4 个拼接变体，实际可播 30 种）：菜单移动/确认/返回/拒绝、吃与死亡、落杆、十环/八环/四环/脱靶、硬币、放球/撞钉/入槽、滑动/合并/达成、蒙提霍尔输赢。
 
+---
+
 ## 已知限制
 
 - **源码上限 64KB**：`arcade.lua` 已 53.8KB，再加内容要留意；文字一帧 32 条也接近上限。
-- **旋钮是绝对值不是编码器**：没有"转了多少格"的概念，所有旋钮交互都要自己做基线与相对量。
+- **旋钮是电位器不是编码器**：270° 机械行程、无档位，读不到"转了几格"，所有旋钮交互都要自己做基线与相对量。
 - **无 `pcall`**：设备端 Lua 不给 `pcall`，任何可能越界的参数都得在调用前夹取，否则直接抛错中断安装。
 - **仿真器不是真机**：屏幕校验逻辑照抄 C，但时序、字体渲染、音频输出仍需真机确认。
 - `miniapp` 系列调试命令会常驻固件，发布版建议用 Kconfig 裁掉。
+- 助教的语音链路依赖聆思云平台，离线不可用。
+
+---
 
 ## 许可证与致谢
 
-- 本仓库自有代码（`apps/`、`tools/`、`docs/`）以 MIT 发布，见 [LICENSE](LICENSE)。
+- 本仓库自有内容（`apps/`、`assistant/`、`tools/`、`docs/`）以 MIT 发布，见 [LICENSE](LICENSE)。
 - `patches/` 是对**聆思官方 arc SDK** 的修改。官方 SDK 未附带开源许可证文件，因此本仓库只分发 diff，不 redistribute 任何官方源码；使用补丁前请自行获取 SDK 并遵守其条款。
+- 按键与旋钮模块来自 Risym（risym.tmall.com），规格摘自其公开的商品文档。
 - 感谢聆思（ListenAI）提供硬件、SDK 与 `ling` 工具链。
