@@ -1,0 +1,23 @@
+# 依赖与构建产物
+node_modules/
+__pycache__/
+*.pyc
+dist/
+
+# 生成物（由 tools/gen_builtin.py 产出，不进仓库）
+miniapp_builtin_*.c
+miniapp_builtin_*.h
+
+# 固件与镜像
+*.bin
+*.lpk
+build/
+build-*/
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.log

@@ -1,0 +1,1209 @@
+diff --git a/apps/arcs-mini/mcp-tools/CMakeLists.txt b/apps/arcs-mini/mcp-tools/CMakeLists.txt
+index 5aa60cd0..7393eb77 100644
+--- a/apps/arcs-mini/mcp-tools/CMakeLists.txt
++++ b/apps/arcs-mini/mcp-tools/CMakeLists.txt
+@@ -25,4 +25,12 @@ listenai_include_directories(
+ 
+ if(CONFIG_MINIAPP)
+     listenai_library_sources(mcp_tool_miniapp.c mcp_tool_miniapp_control.c)
++    listenai_library_sources(
++        mcp_tool_miniapp_builtin.c
++        miniapp_builtin_dice.c
++        miniapp_builtin_coin.c
++        miniapp_builtin_galton.c
++        miniapp_builtin_hwtest.c
++        miniapp_builtin_arcade.c
++    )
+ endif()
+diff --git a/apps/arcs-mini/mcp-tools/mcp_tool_miniapp.c b/apps/arcs-mini/mcp-tools/mcp_tool_miniapp.c
+index ecaf7785..07fdeb12 100644
+--- a/apps/arcs-mini/mcp-tools/mcp_tool_miniapp.c
++++ b/apps/arcs-mini/mcp-tools/mcp_tool_miniapp.c
+@@ -34,7 +34,12 @@ bool app_mcp_tool_call_allowed(const char *name)
+             strcmp(name, VOLUME_CONTROL_NAME) == 0 ||
+             strcmp(name, DESCRIBE_NAME) == 0 ||
+             strcmp(name, ACTION_NAME) == 0 ||
+-            strcmp(name, DUPLEX_SWITCH_NAME) == 0));
++            strcmp(name, DUPLEX_SWITCH_NAME) == 0 ||
++            strcmp(name, "play_dice") == 0 ||
++            strcmp(name, "play_coin") == 0 ||
++            strcmp(name, "play_galton") == 0 ||
++            strcmp(name, "play_hwtest") == 0 ||
++            strcmp(name, "play_arcade") == 0));
+ }
+ 
+ typedef struct {
+diff --git a/apps/arcs-mini/mcp-tools/mcp_tool_miniapp_builtin.c b/apps/arcs-mini/mcp-tools/mcp_tool_miniapp_builtin.c
+new file mode 100644
+index 00000000..8d01bd95
+--- /dev/null
++++ b/apps/arcs-mini/mcp-tools/mcp_tool_miniapp_builtin.c
+@@ -0,0 +1,415 @@
++#include <stdio.h>
++#include <string.h>
++
++#include "FreeRTOS.h"
++#include "task.h"
++#include "lisa_mem.h"
++#include "mcp.h"
++#include "miniapp.h"
++#include "miniapp_builtin_dice.h"
++#include "miniapp_builtin_coin.h"
++#include "miniapp_builtin_galton.h"
++#include "miniapp_builtin_hwtest.h"
++#include "miniapp_builtin_arcade.h"
++#include "mcp_miniapp_result.h"
++#include "lisa_log.h"
++#include "shell.h"
++#include <stdlib.h>
++#include "lvgl.h"
++#include "lisa_ui_fonts.h"
++
++#define BUILTIN_CALL_ID_MAX 127
++
++/* 内置小应用描述：工具名、源码、启动文案，全部集中在这里。 */
++typedef struct {
++    const char *id;
++    const char *version;
++    const char *hash;
++    const unsigned char *lua;
++    uint32_t size;
++    const char *tool_name;
++    const char *tool_desc;
++    const char *launch_msg;
++    const char *task_name;
++} builtin_app_t;
++
++static const builtin_app_t k_builtin_apps[] = {
++    {
++        MINIAPP_DICE_ID, MINIAPP_DICE_VERSION, MINIAPP_DICE_MD5,
++        miniapp_dice_lua, MINIAPP_DICE_SIZE,
++        "play_dice",
++        "直接启动本机内置的掷骰子小应用，无需联网下载。"
++        "用户想玩骰子、掷骰子、扔骰子、打开骰子小游戏时调用。无需参数。",
++        "骰子小应用已启动",
++        "miniapp.dice",
++    },
++    {
++        MINIAPP_COIN_ID, MINIAPP_COIN_VERSION, MINIAPP_COIN_MD5,
++        miniapp_coin_lua, MINIAPP_COIN_SIZE,
++        "play_coin",
++        "直接启动本机内置的掷硬币小应用，演示大数定律，无需联网下载。"
++        "用户想玩掷硬币、抛硬币、猜正反面、看正面频率时调用。无需参数。",
++        "掷硬币小应用已启动",
++        "miniapp.coin",
++    },
++    {
++        MINIAPP_GALTON_ID, MINIAPP_GALTON_VERSION, MINIAPP_GALTON_MD5,
++        miniapp_galton_lua, MINIAPP_GALTON_SIZE,
++        "play_galton",
++        "直接启动本机内置的高尔顿板小应用，演示正态分布/中心极限定理，无需联网下载。"
++        "用户想玩高尔顿板、看正态分布、小球下落、中心极限定理演示时调用。无需参数。",
++        "高尔顿板小应用已启动",
++        "miniapp.galton",
++    },
++    {
++        MINIAPP_HWTEST_ID, MINIAPP_HWTEST_VERSION, MINIAPP_HWTEST_MD5,
++        miniapp_hwtest_lua, MINIAPP_HWTEST_SIZE,
++        "play_hwtest",
++        "直接启动本机内置的硬件接线自检界面，实时显示 4 个按钮和 1 个旋钮的电平/数值，无需联网下载。"
++        "用户想调试接线、硬件自检、看按钮或旋钮读数时调用。无需参数。",
++        "硬件自检界面已启动",
++        "miniapp.hwtest",
++    },
++    {
++        MINIAPP_ARCADE_ID, MINIAPP_ARCADE_VERSION, MINIAPP_ARCADE_MD5,
++        miniapp_arcade_lua, MINIAPP_ARCADE_SIZE,
++        "play_arcade",
++        "直接启动本机内置的游戏大厅，含贪吃蛇、概率实验室（掷骰子/掷硬币/高尔顿板/频率收敛/蒙提霍尔/二项分布）、平衡挑战、打靶、硬件自检，无需联网下载。"
++        "用户想打开游戏大厅、玩游戏、玩贪吃蛇、看概率实验、打靶、平衡挑战时调用。无需参数。",
++        "游戏大厅已启动",
++        "miniapp.arcade",
++    },
++};
++
++typedef struct {
++    char call_id[BUILTIN_CALL_ID_MAX + 1];
++    const builtin_app_t *app;
++} builtin_job_t;
++
++static cJSON *builtin_list(const char *name, const builtin_app_t *app)
++{
++    cJSON *tool = mcp_tool_list_info_create_default(name, app->tool_desc);
++    if (!tool) {
++        return NULL;
++    }
++    /* 无参数工具：additionalProperties 用 JSON 布尔而非字符串。 */
++    cJSON *schema = cJSON_GetObjectItemCaseSensitive(tool, "inputSchema");
++    cJSON_DeleteItemFromObjectCaseSensitive(schema, "additionalProperties");
++    if (!cJSON_AddBoolToObject(schema, "additionalProperties", false)) {
++        cJSON_Delete(tool);
++        return NULL;
++    }
++    return tool;
++}
++
++static void builtin_worker(void *argument)
++{
++    builtin_job_t *job = argument;
++    const builtin_app_t *app = job->app;
++
++    miniapp_package_t package = {0};
++    snprintf(package.id, sizeof(package.id), "%s", app->id);
++    snprintf(package.version, sizeof(package.version), "%s", app->version);
++    snprintf(package.name, sizeof(package.name), "%s", app->tool_name);
++    snprintf(package.hash, sizeof(package.hash), "%s", app->hash);
++    package.size = app->size;
++
++    char error[128] = {0};
++    int rc = miniapp_install(&package, (const char *)app->lua, error, sizeof(error));
++
++    char message[180];
++    if (rc == 0) {
++        snprintf(message, sizeof(message), "%s", app->launch_msg);
++        LISA_LOGI("mcp", "builtin app %s launched (size=%u)", app->id, app->size);
++    } else {
++        snprintf(message, sizeof(message), "miniapp launch failed: %s", error);
++        LISA_LOGW("mcp", "builtin app %s install failed: %s", app->id, error);
++    }
++
++    cJSON *result = miniapp_mcp_result(app->tool_name, message, rc != 0);
++    if (result) {
++        (void)mcp_tool_call_result_response(job->call_id, result);
++        cJSON_Delete(result);
++    }
++    miniapp_install_end();
++    lisa_mem_free(job);
++    vTaskDelete(NULL);
++}
++
++static cJSON *builtin_call(const char *id, const char *name, cJSON *args,
++                           const builtin_app_t *app)
++{
++    if (!id || !id[0] || strlen(id) > BUILTIN_CALL_ID_MAX || !cJSON_IsObject(args)) {
++        return miniapp_mcp_result(name, "invalid call ID or arguments", true);
++    }
++    if (cJSON_GetArraySize(args) != 0) {
++        return miniapp_mcp_result(name, "this tool takes no arguments", true);
++    }
++
++    builtin_job_t *job = lisa_mem_calloc(1, sizeof(*job));
++    if (!job) {
++        return miniapp_mcp_result(name, "not enough memory for launch", true);
++    }
++    memcpy(job->call_id, id, strlen(id) + 1);
++    job->app = app;
++
++    if (!miniapp_install_begin()) {
++        lisa_mem_free(job);
++        return miniapp_mcp_result(name, "miniapp runtime unavailable or install in progress", true);
++    }
++    if (xTaskCreate(builtin_worker, app->task_name, 4096, job, 4, NULL) != pdPASS) {
++        miniapp_install_end();
++        lisa_mem_free(job);
++        return miniapp_mcp_result(name, "failed to start launch worker", true);
++    }
++    return NULL; /* Async response after launch. */
++}
++
++static cJSON *play_dice_list(const char *name) { return builtin_list(name, &k_builtin_apps[0]); }
++static cJSON *play_dice_call(const char *id, const char *name, cJSON *args) {
++    return builtin_call(id, name, args, &k_builtin_apps[0]);
++}
++MCP_TOOL_DEFINE(play_dice, play_dice_list, play_dice_call);
++
++static cJSON *play_coin_list(const char *name) { return builtin_list(name, &k_builtin_apps[1]); }
++static cJSON *play_coin_call(const char *id, const char *name, cJSON *args) {
++    return builtin_call(id, name, args, &k_builtin_apps[1]);
++}
++MCP_TOOL_DEFINE(play_coin, play_coin_list, play_coin_call);
++
++static cJSON *play_galton_list(const char *name) { return builtin_list(name, &k_builtin_apps[2]); }
++static cJSON *play_galton_call(const char *id, const char *name, cJSON *args) {
++    return builtin_call(id, name, args, &k_builtin_apps[2]);
++}
++MCP_TOOL_DEFINE(play_galton, play_galton_list, play_galton_call);
++
++static cJSON *play_hwtest_list(const char *name) { return builtin_list(name, &k_builtin_apps[3]); }
++static cJSON *play_hwtest_call(const char *id, const char *name, cJSON *args) {
++    return builtin_call(id, name, args, &k_builtin_apps[3]);
++}
++MCP_TOOL_DEFINE(play_hwtest, play_hwtest_list, play_hwtest_call);
++
++static cJSON *play_arcade_list(const char *name) { return builtin_list(name, &k_builtin_apps[4]); }
++static cJSON *play_arcade_call(const char *id, const char *name, cJSON *args) {
++    return builtin_call(id, name, args, &k_builtin_apps[4]);
++}
++MCP_TOOL_DEFINE(play_arcade, play_arcade_list, play_arcade_call);
++
++/* ---------------- 开发期控制台命令（ADB 调试用） ----------------
++ * 语音链路要等模型，排查时太慢。这里直接从 console 装内置小应用，
++ * 并打印安装耗时/帧计数/最后一条 Lua 错误。 */
++#define BUILTIN_APP_COUNT (sizeof(k_builtin_apps) / sizeof(k_builtin_apps[0]))
++
++static const builtin_app_t *builtin_find(const char *name)
++{
++    for (size_t i = 0; i < BUILTIN_APP_COUNT; ++i) {
++        if (strcmp(k_builtin_apps[i].id, name) == 0 ||
++            strcmp(k_builtin_apps[i].tool_name, name) == 0) {
++            return &k_builtin_apps[i];
++        }
++    }
++    return NULL;
++}
++
++static void builtin_print_status(Shell *shell)
++{
++    miniapp_status_t st;
++    miniapp_get_status(&st);
++    shellPrint(shell, "installed=%d active=%d size=%u frames=%u dropped=%u last=%ums max=%ums\r\n",
++               st.installed ? 1 : 0, st.active ? 1 : 0, (unsigned)st.source_size,
++               (unsigned)st.frames, (unsigned)st.dropped_frames,
++               (unsigned)st.last_frame_ms, (unsigned)st.max_frame_ms);
++    if (st.last_error[0]) {
++        shellPrint(shell, "last_error: %s\r\n", st.last_error);
++    }
++}
++
++static int cmd_miniapp(int argc, char **argv)
++{
++    Shell *shell = shellGetCurrent();
++
++    if (argc < 2) {
++        shellPrint(shell, "usage:\r\n");
++        shellPrint(shell, "  miniapp list          list builtin apps\r\n");
++        shellPrint(shell, "  miniapp run <id>      install + launch a builtin app\r\n");
++        shellPrint(shell, "  miniapp status        runtime counters / last Lua error\r\n");
++        shellPrint(shell, "  miniapp key <dir> <0|1>  inject up/down/left/right key\r\n");
++        shellPrint(shell, "  miniapp btn           simulate side function key click\r\n");
++        shellPrint(shell, "  miniapp screen        dump the last presented frame\r\n");
++        shellPrint(shell, "  miniapp glyph <hex>.. dump font glyph bitmap for codepoints\r\n");
++        return -1;
++    }
++
++    if (strcmp(argv[1], "glyph") == 0) {
++        /* 字形自检：确认某个码位在 lv_font_chinese_16 里真的有字形，并把位图打成点阵。
++         * 用途：验证 ↑↓←→ 这类符号是否可用、朝向是否正确。 */
++        if (argc < 3) {
++            shellPrint(shell, "usage: miniapp glyph 2191 2193  (hex codepoints)\r\n");
++            return -1;
++        }
++        for (int i = 2; i < argc; ++i) {
++            uint32_t cp = (uint32_t)strtoul(argv[i], NULL, 16);
++            lv_font_glyph_dsc_t g;
++            memset(&g, 0, sizeof(g));
++            if (!lv_font_get_glyph_dsc(&lv_font_chinese_16, &g, cp, 0)) {
++                shellPrint(shell, "U+%04lX: no glyph\r\n", (unsigned long)cp);
++                continue;
++            }
++            shellPrint(shell, "U+%04lX box=%dx%d ofs=(%d,%d) adv=%d\r\n", (unsigned long)cp,
++                       (int)g.box_w, (int)g.box_h, (int)g.ofs_x, (int)g.ofs_y, (int)g.adv_w);
++            const uint8_t *bmp = lv_font_get_glyph_bitmap(&lv_font_chinese_16, cp);
++            if (!bmp) {
++                shellPrint(shell, "  <no bitmap>\r\n");
++                continue;
++            }
++            char line[48];
++            int n = g.box_w < 40 ? (int)g.box_w : 40;
++            for (int y = 0; y < (int)g.box_h && y < 24; ++y) {
++                for (int x = 0; x < n; ++x) {
++                    uint32_t bit = (uint32_t)y * (uint32_t)g.box_w + (uint32_t)x;
++                    line[x] = ((bmp[bit >> 3] >> (7 - (bit & 7))) & 1) ? '#' : '.';
++                }
++                line[n] = '\0';
++                shellPrint(shell, "  %s\r\n", line);
++            }
++        }
++        return 0;
++    }
++
++    if (strcmp(argv[1], "key") == 0) {
++#ifdef CONFIG_MINIAPP_ADB_DEBUG
++        if (argc < 4) {
++            shellPrint(shell, "usage: miniapp key <up|down|left|right> <0|1>\r\n");
++            return -1;
++        }
++        char bank = 0;
++        int pin = 0;
++        if (strcmp(argv[2], "up") == 0) {
++            bank = 'a'; pin = 0;
++        } else if (strcmp(argv[2], "left") == 0) {
++            bank = 'a'; pin = 1;
++        } else if (strcmp(argv[2], "right") == 0) {
++            bank = 'b'; pin = 6;
++        } else if (strcmp(argv[2], "down") == 0) {
++            bank = 'b'; pin = 7;
++        } else {
++            shellPrint(shell, "unknown key '%s'\r\n", argv[2]);
++            return -1;
++        }
++        int level = atoi(argv[3]) ? 1 : 0;
++        if (miniapp_debug_set_pin(bank, pin, level) != 0) {
++            shellPrint(shell, "inject failed\r\n");
++            return -1;
++        }
++        shellPrint(shell, "key %s=%d\r\n", argv[2], level);
++        return 0;
++#else
++        shellPrint(shell, "key injection needs CONFIG_MINIAPP_ADB_DEBUG\r\n");
++        return -1;
++#endif
++    }
++
++    if (strcmp(argv[1], "btn") == 0) {
++        /* 模拟板载功能键（侧键）单击：走和真实按键相同的 miniapp_button_click 路径，
++         * 用来验证 on_button_click 的返回逻辑。 */
++        int rc = miniapp_button_click("function");
++        shellPrint(shell, "button click rc=%d\r\n", rc);
++        return 0;
++    }
++
++    if (strcmp(argv[1], "screen") == 0) {
++        miniapp_scene_t *scene = lisa_mem_calloc(1, sizeof(*scene));
++        if (!scene) {
++            shellPrint(shell, "no memory for dump\r\n");
++            return -1;
++        }
++        if (!miniapp_ui_scene_snapshot(scene)) {
++            lisa_mem_free(scene);
++            shellPrint(shell, "no frame presented yet\r\n");
++            return -1;
++        }
++        shellPrint(shell, "bg=%06x shapes=%u texts=%u ordered=%d\r\n",
++                   (unsigned)scene->background, (unsigned)scene->shape_count,
++                   (unsigned)scene->text_count, scene->ordered ? 1 : 0);
++        for (uint16_t i = 0; i < scene->text_count; ++i) {
++            const miniapp_text_t *t = &scene->texts[i];
++            shellPrint(shell, "  T[%u] (%d,%d) %06x \"%s\"\r\n", (unsigned)i, t->x, t->y,
++                       (unsigned)t->color, t->text);
++        }
++        uint16_t limit = scene->shape_count < 48 ? scene->shape_count : 48;
++        for (uint16_t i = 0; i < limit; ++i) {
++            const miniapp_shape_t *s = &scene->shapes[i];
++            shellPrint(shell, "  S[%u] k=%u (%d,%d) %dx%d %06x\r\n", (unsigned)i, s->kind,
++                       s->x, s->y, s->w, s->h, (unsigned)s->color);
++        }
++        if (limit < scene->shape_count) {
++            shellPrint(shell, "  ... %u more\r\n", (unsigned)(scene->shape_count - limit));
++        }
++        lisa_mem_free(scene);
++        return 0;
++    }
++
++    if (strcmp(argv[1], "list") == 0) {
++        for (size_t i = 0; i < BUILTIN_APP_COUNT; ++i) {
++            shellPrint(shell, "[%u] %-8s size=%-6u tool=%s\r\n", (unsigned)i,
++                       k_builtin_apps[i].id, (unsigned)k_builtin_apps[i].size,
++                       k_builtin_apps[i].tool_name);
++        }
++        return 0;
++    }
++
++    if (strcmp(argv[1], "status") == 0) {
++        builtin_print_status(shell);
++        return 0;
++    }
++
++    if (strcmp(argv[1], "audio") == 0) {
++        miniapp_audio_status_t a = {0};
++        miniapp_get_audio_status(&a);
++        shellPrint(shell,
++                   "synth=%u fail=%u notes=%u last=%u/%ums tones=%u busy=%d\r\n",
++                   (unsigned)a.synth_played, (unsigned)a.synth_failed, (unsigned)a.synth_notes,
++                   (unsigned)a.last_notes, (unsigned)a.last_ms, (unsigned)a.tones, a.busy ? 1 : 0);
++        return 0;
++    }
++
++    if (strcmp(argv[1], "run") == 0) {
++        if (argc < 3) {
++            shellPrint(shell, "usage: miniapp run <id>\r\n");
++            return -1;
++        }
++        const builtin_app_t *app = builtin_find(argv[2]);
++        if (!app) {
++            shellPrint(shell, "unknown app '%s'\r\n", argv[2]);
++            return -1;
++        }
++
++        miniapp_package_t package = {0};
++        snprintf(package.id, sizeof(package.id), "%s", app->id);
++        snprintf(package.version, sizeof(package.version), "%s", app->version);
++        snprintf(package.name, sizeof(package.name), "%s", app->tool_name);
++        snprintf(package.hash, sizeof(package.hash), "%s", app->hash);
++        package.size = app->size;
++
++        if (!miniapp_install_begin()) {
++            shellPrint(shell, "install busy or runtime unavailable\r\n");
++            return -1;
++        }
++        char error[128] = {0};
++        TickType_t t0 = xTaskGetTickCount();
++        int rc = miniapp_install(&package, (const char *)app->lua, error, sizeof(error));
++        uint32_t cost = (uint32_t)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS);
++        shellPrint(shell, "install %s rc=%d cost=%ums%s%s\r\n", app->id, rc, (unsigned)cost,
++                   error[0] ? " err=" : "", error);
++        miniapp_install_end();
++        builtin_print_status(shell);
++        return rc == 0 ? 0 : -1;
++    }
++
++    shellPrint(shell, "unknown subcommand '%s'\r\n", argv[1]);
++    return -1;
++}
++
++SHELL_EXPORT_CMD(SHELL_CMD_PERMISSION(0) | SHELL_CMD_TYPE(SHELL_TYPE_CMD_MAIN) |
++                     SHELL_CMD_DISABLE_RETURN,
++                 miniapp, cmd_miniapp, "miniapp list|run|status - launch builtin app from console");
+diff --git a/apps/arcs-mini/miniapp/Kconfig b/apps/arcs-mini/miniapp/Kconfig
+index 318f035e..cd563ce8 100644
+--- a/apps/arcs-mini/miniapp/Kconfig
++++ b/apps/arcs-mini/miniapp/Kconfig
+@@ -26,7 +26,7 @@ config MINIAPP_SOURCE_MAX_BYTES
+ config MINIAPP_HEAP_MAX_BYTES
+     int "Maximum heap bytes per Lua VM"
+     range 65536 524288
+-    default 393216
++    default 524288
+     help
+       Replacing an active app temporarily needs two VMs for rollback.
+ 
+diff --git a/apps/arcs-mini/miniapp/miniapp.h b/apps/arcs-mini/miniapp/miniapp.h
+index 7ec8da1d..aadc5762 100644
+--- a/apps/arcs-mini/miniapp/miniapp.h
++++ b/apps/arcs-mini/miniapp/miniapp.h
+@@ -12,14 +12,16 @@
+ #define MINIAPP_TEXT_FONT_PX 16
+ #define MINIAPP_SOURCE_MAX CONFIG_MINIAPP_SOURCE_MAX_BYTES
+ #define MINIAPP_MAX_SHAPES 256
+-#define MINIAPP_MAX_TEXTS 16
++/* 一帧最多文字段数。16 对多数页面够用，但 2048 这类“每个格子一个数字”的
++ * 布局需要 16 个格子 + 标题/分数/提示，会顶到上限抛错，故放宽到 32。 */
++#define MINIAPP_MAX_TEXTS 32
+ #define MINIAPP_TEXT_MAX 63
+ #define MINIAPP_SYNTH_QUEUE_DEPTH 4
+ #define MINIAPP_SYNTH_MAX_DURATION_MS 60000
+ #define MINIAPP_LUA_HEAP_LIMIT CONFIG_MINIAPP_HEAP_MAX_BYTES
+ #define MINIAPP_TICK_MS 20u
+ #define MINIAPP_CHUNK_INSTRUCTION_LIMIT 500000u
+-#define MINIAPP_CHUNK_DEADLINE_MS 150u
++#define MINIAPP_CHUNK_DEADLINE_MS 2000u
+ #define MINIAPP_CALLBACK_INSTRUCTION_LIMIT 250000u
+ /* Allow occasional response parsing to exceed the tick interval. Runtime
+  * statistics discount task preemption; the instruction limit stays bounded. */
+@@ -133,6 +135,21 @@ typedef struct {
+     char last_error[128];
+ } miniapp_status_t;
+ 
++/* 音频遥测（仅供 CONFIG_MINIAPP_ADB_DEBUG 的 `miniapp audio` 使用）：
++ * 判断“音效到底有没有播出去”，光看 Lua 没报错是不够的——命令入队后还要
++ * 过音频线程，参数合法但被后续命令打断同样会没声音。 */
++typedef struct {
++    uint32_t synth_played;   /* 完整播完的乐谱段数 */
++    uint32_t synth_failed;   /* 播放失败的乐谱段数 */
++    uint32_t synth_notes;    /* 累计提交的音符数 */
++    uint32_t last_notes;     /* 最近一段乐谱的音符数 */
++    uint32_t last_ms;        /* 最近一段乐谱的时长 */
++    uint32_t tones;          /* 单音 buzzer.play 次数 */
++    bool busy;               /* 音频线程当前是否在放 */
++} miniapp_audio_status_t;
++
++void miniapp_get_audio_status(miniapp_audio_status_t *out);
++
+ /* Strings are bounded UTF-8 bytes; identifiers are opaque, never paths. */
+ #define MINIAPP_ID_MAX 127
+ #define MINIAPP_VERSION_MAX 127
+@@ -153,8 +170,12 @@ typedef struct miniapp_source miniapp_source_t;
+ miniapp_source_t *miniapp_source_acquire(void);
+ void miniapp_source_release(miniapp_source_t *source);
+ const char *miniapp_source_data(const miniapp_source_t *source, size_t *size);
++/* Console-side synthetic input: level 0/1 forces a pin, -1 releases it. */
++int miniapp_debug_set_pin(char bank, int pin, int level);
+ #endif
+ int miniapp_init(void);
++/* Console diagnostics: copy of the runtime status counters. */
++void miniapp_get_status(miniapp_status_t *out);
+ bool miniapp_is_active(void);
+ int miniapp_button_click(const char *button_id);
+ int miniapp_exit(void);
+@@ -178,6 +199,8 @@ int miniapp_ui_init(void);
+ int miniapp_ui_open(void);
+ int miniapp_ui_close(void);
+ int miniapp_ui_present(const miniapp_scene_t *scene);
++/* Console diagnostics: read back the last presented scene (what is on screen). */
++bool miniapp_ui_scene_snapshot(miniapp_scene_t *out);
+ int miniapp_ui_wait_frame(uint32_t timeout_ms);
+ void miniapp_runtime_ui_closed(void);
+ 
+diff --git a/apps/arcs-mini/miniapp/miniapp_runtime.c b/apps/arcs-mini/miniapp/miniapp_runtime.c
+index 1e28ecfd..c1db8318 100644
+--- a/apps/arcs-mini/miniapp/miniapp_runtime.c
++++ b/apps/arcs-mini/miniapp/miniapp_runtime.c
+@@ -38,6 +38,10 @@
+ #include "voice_player_comm.h"
+ #include "lisa_http.h"
+ #include "HTTPCUsr_api.h"
++#include "lisa_gpio.h"
++#include "lisa_adc.h"
++#include "lisa_device.h"
++#include "IOMuxManager.h"
+ 
+ #define TAG "miniapp"
+ #define MINIAPP_HOOK_GRANULARITY 1000u
+@@ -168,6 +172,26 @@ static miniapp_http_request_t *s_http_requests[MINIAPP_HTTP_MAX_REQUESTS];
+ static uint32_t s_http_next_id = 1;
+ static uint32_t s_http_generation;
+ static miniapp_status_t s_status;
++/* 每个端口各自记录“已配置为输入下拉”的引脚，见 gpio.read。 */
++static uint32_t s_gpio_ready[3];
++
++/* Snapshot for the on-device `miniapp status` console command: frame counts,
++ * worst frame time and the last Lua error, so runtime problems can be measured
++ * over ADB instead of guessed from the screen. */
++void miniapp_get_status(miniapp_status_t *out)
++{
++    if (!out) return;
++    taskENTER_CRITICAL();
++    *out = s_status;
++    taskEXIT_CRITICAL();
++}
++
++#ifdef CONFIG_MINIAPP_ADB_DEBUG
++/* Synthetic input for headless debugging (see debug.input / debug.knob). */
++static uint32_t s_sim_gpio_mask[3];
++static uint8_t s_sim_gpio_level[3][32];
++static int s_sim_knob = -1;
++#endif
+ static miniapp_package_t s_current;
+ static volatile bool s_active;
+ static volatile bool s_install_busy;
+@@ -178,6 +202,30 @@ static uint32_t s_tts_next_id = 1;
+ static uint32_t s_tts_worker_id;
+ static miniapp_tts_job_t *s_tts_requests[MINIAPP_TTS_RESULT_SLOTS];
+ 
++/* Audio telemetry for `miniapp audio`: proves a score was actually rendered and
++ * finished, instead of merely accepted by the Lua binding. */
++static volatile uint32_t s_audio_synth_played;
++static volatile uint32_t s_audio_synth_failed;
++static volatile uint32_t s_audio_synth_notes;
++static volatile uint32_t s_audio_last_notes;
++static volatile uint32_t s_audio_last_ms;
++static volatile uint32_t s_audio_tones;
++static volatile bool s_audio_busy;
++
++void miniapp_get_audio_status(miniapp_audio_status_t *out)
++{
++    if (!out) return;
++    taskENTER_CRITICAL();
++    out->synth_played = s_audio_synth_played;
++    out->synth_failed = s_audio_synth_failed;
++    out->synth_notes = s_audio_synth_notes;
++    out->last_notes = s_audio_last_notes;
++    out->last_ms = s_audio_last_ms;
++    out->tones = s_audio_tones;
++    out->busy = s_audio_busy;
++    taskEXIT_CRITICAL();
++}
++
+ #ifdef CONFIG_MINIAPP_ADB_DEBUG
+ struct miniapp_source {
+     unsigned refs;
+@@ -408,6 +456,174 @@ static int miniapp_lua_screen_present(lua_State *L)
+     return 0;
+ }
+ 
++static int miniapp_lua_gpio_read(lua_State *L)
++{
++    /* gpio.read(bank, pin) -> 0/1 (bank "a"|"b"|"d"), -1 on error */
++    const char *bank = luaL_checkstring(L, 1);
++    int pin = (int)luaL_checkinteger(L, 2);
++
++    lisa_device_t *dev = NULL;
++    uint8_t pad = 0;
++    int is_exgpio = 0;
++    int bank_index = -1;
++    if (bank[0] == 'a' || bank[0] == 'A') {
++        dev = lisa_device_get("gpioa");
++        pad = CSK_IOMUX_PAD_A;
++        bank_index = 0;
++    } else if (bank[0] == 'b' || bank[0] == 'B') {
++        dev = lisa_device_get("gpiob");
++        pad = CSK_IOMUX_PAD_B;
++        bank_index = 1;
++    } else if (bank[0] == 'd' || bank[0] == 'D') {
++        dev = lisa_device_get("exgpiod"); /* CH32V003 的 D 端口（扩展口 PD4） */
++        is_exgpio = 1;
++        bank_index = 2;
++    } else {
++        return luaL_error(L, "unknown gpio bank (use 'a', 'b' or 'd')");
++    }
++    if (pin < 0 || pin > 31) {
++        return luaL_error(L, "pin out of range (0..31)");
++    }
++#ifdef CONFIG_MINIAPP_ADB_DEBUG
++    /* Headless debugging: a synthetic level replaces the hardware read. */
++    if (bank_index >= 0 && (s_sim_gpio_mask[bank_index] & (1u << pin))) {
++        lua_pushinteger(L, s_sim_gpio_level[bank_index][pin]);
++        return 1;
++    }
++#endif
++    if (!lisa_device_ready(dev)) {
++        lua_pushinteger(L, -1);
++        return 1;
++    }
++
++    /* 切回 GPIO 功能并配输入下拉，再读电平（复用 4G/UART 引脚作按键输入）。
++     * Mini3 扩展口 GPIO 复用功能号不统一：PA00/PA01 本是 4G 的 EN/RST，
++     * 其 GPIO 功能号是 1；PB06/PB07（UART2）用默认功能 0。若统一用
++     * FUNC_DEFAULT 会把 PA0/PA1 切错功能、读不到电平变化。
++     * 外接按键模块为「高电平有效」：松开 OUT 被模块下拉到低、按下输出高，
++     * 故用输入下拉，空闲读 0、按下读 1。
++     * exgpio（CH32V003）走 I2C 桥接，无需 pinmux，直接读其输入寄存器。 */
++    if (!is_exgpio) {
++        uint32_t iomux_func = CSK_IOMUX_FUNC_DEFAULT;
++        if (pad == CSK_IOMUX_PAD_A && (pin == 0 || pin == 1)) {
++            iomux_func = CSK_IOMUX_FUNC_ALTER1; /* PA00/PA01 GPIO 功能号 = 1 */
++        }
++        /* 首次配置要等下拉建立：引脚刚从 UART/4G 复用功能切过来时，立即读
++         * 会得到瞬时高电平，被 Lua 误判成“按键已按下”（短脚本里会让开局
++         * 直接误触）。这里只在第一次配置时延时并丢弃首个采样。 */
++        bool first = !(s_gpio_ready[bank_index] & (1u << pin));
++        IOMuxManager_PinConfigure(pad, (uint8_t)pin, iomux_func);
++        if (lisa_gpio_configure(dev, (uint32_t)pin, LISA_GPIO_CONFIG_INPUT_PULLDOWN) != 0) {
++            lua_pushinteger(L, -1);
++            return 1;
++        }
++        if (first) {
++            vTaskDelay(pdMS_TO_TICKS(2));
++            (void)lisa_gpio_read_pin(dev, (uint32_t)pin);
++            s_gpio_ready[bank_index] |= (1u << pin);
++        }
++    }
++    int level = lisa_gpio_read_pin(dev, (uint32_t)pin);
++    if (level == LISA_GPIO_HIGH) {
++        lua_pushinteger(L, 1);
++    } else if (level == LISA_GPIO_LOW) {
++        lua_pushinteger(L, 0);
++    } else {
++        lua_pushinteger(L, -1);
++    }
++    return 1;
++}
++
++static int miniapp_lua_adc_read(lua_State *L)
++{
++    /* adc.read(channel) -> raw value (CH32V003 exadc, 0..7), -1 on error */
++    int channel = (int)luaL_checkinteger(L, 1);
++    if (channel < 0 || channel > 7) {
++        return luaL_error(L, "channel out of range (0..7)");
++    }
++#ifdef CONFIG_MINIAPP_ADB_DEBUG
++    if (channel == 7 && s_sim_knob >= 0) {
++        lua_pushinteger(L, s_sim_knob);
++        return 1;
++    }
++#endif
++    lisa_device_t *dev = lisa_device_get("exadc");
++    if (!lisa_device_ready(dev)) {
++        lua_pushinteger(L, -1);
++        return 1;
++    }
++    uint16_t val = 0;
++    if (lisa_adc_read(dev, (uint32_t)channel, &val) != LISA_DEVICE_OK) {
++        lua_pushinteger(L, -1);
++        return 1;
++    }
++    lua_pushinteger(L, (lua_Integer)val);
++    return 1;
++}
++
++#ifdef CONFIG_MINIAPP_ADB_DEBUG
++static int miniapp_lua_debug_log(lua_State *L)
++{
++    /* debug.log(str): emit a line to the console, readable through adb shell. */
++    const char *msg = luaL_checkstring(L, 1);
++    LISA_LOGI(TAG, "[lua] %s", msg);
++    return 0;
++}
++
++static int miniapp_lua_debug_input(lua_State *L)
++{
++    /* debug.input(bank, pin, level): force one pin (level < 0 clears it).
++     * debug.input(): clear every override and the knob. */
++    if (lua_isnoneornil(L, 1)) {
++        memset(s_sim_gpio_mask, 0, sizeof(s_sim_gpio_mask));
++        s_sim_knob = -1;
++        return 0;
++    }
++    const char *bank = luaL_checkstring(L, 1);
++    int pin = (int)luaL_checkinteger(L, 2);
++    int level = (int)luaL_checkinteger(L, 3);
++    int index = -1;
++    if (bank[0] == 'a' || bank[0] == 'A') index = 0;
++    else if (bank[0] == 'b' || bank[0] == 'B') index = 1;
++    else if (bank[0] == 'd' || bank[0] == 'D') index = 2;
++    if (index < 0 || pin < 0 || pin > 31) {
++        return luaL_error(L, "debug.input: bad bank or pin");
++    }
++    if (level < 0) {
++        s_sim_gpio_mask[index] &= ~(1u << pin);
++    } else {
++        s_sim_gpio_mask[index] |= (1u << pin);
++        s_sim_gpio_level[index][pin] = (uint8_t)(level ? 1 : 0);
++    }
++    return 0;
++}
++
++static int miniapp_lua_debug_knob(lua_State *L)
++{
++    /* debug.knob(value): force the ADC ch7 reading; nil clears it. */
++    s_sim_knob = lua_isnoneornil(L, 1) ? -1 : (int)luaL_checkinteger(L, 1);
++    return 0;
++}
++
++/* Console side of the same override, used by `miniapp key` so the game can be
++ * driven over ADB without touching the board. */
++int miniapp_debug_set_pin(char bank, int pin, int level)
++{
++    int index = -1;
++    if (bank == 'a' || bank == 'A') index = 0;
++    else if (bank == 'b' || bank == 'B') index = 1;
++    else if (bank == 'd' || bank == 'D') index = 2;
++    if (index < 0 || pin < 0 || pin > 31) return -1;
++    if (level < 0) {
++        s_sim_gpio_mask[index] &= ~(1u << pin);
++    } else {
++        s_sim_gpio_mask[index] |= (1u << pin);
++        s_sim_gpio_level[index][pin] = (uint8_t)(level ? 1 : 0);
++    }
++    return 0;
++}
++#endif
++
+ static int miniapp_lua_led_on(lua_State *L)
+ {
+     if (strcmp(luaL_checkstring(L, 1), "status") != 0) {
+@@ -767,6 +983,7 @@ static void miniapp_synth_play_score(const miniapp_buzzer_command_t *command)
+     int16_t pcm[1024]; /* 64 ms; no full-song PCM allocation. */
+     uint32_t resume_sample = 0;
+     int result = APP_PLAYER_OK;
++    s_audio_busy = true;
+     miniapp_synth_init(&synth);
+ #ifdef CONFIG_APP_PLAYER_AUDIO_FOCUS
+     app_player_register_focus_cb(miniapp_player, miniapp_synth_focus, NULL);
+@@ -858,6 +1075,15 @@ static void miniapp_synth_play_score(const miniapp_buzzer_command_t *command)
+     }
+     LISA_LOGI(TAG, "synth finished: notes=%u samples=%u/%u result=%d", command->score->count, synth.cursor,
+               command->score->samples, result);
++    s_audio_last_notes = command->score->count;
++    s_audio_last_ms = command->score->samples / 16u;
++    s_audio_synth_notes += command->score->count;
++    if (result == APP_PLAYER_OK) {
++        ++s_audio_synth_played;
++    } else {
++        ++s_audio_synth_failed;
++    }
++    s_audio_busy = false;
+ }
+ 
+ static void miniapp_buzzer_task(void *argument)
+@@ -917,6 +1143,7 @@ static void miniapp_buzzer_task(void *argument)
+             LISA_LOGW(TAG, "failed to play buzzer");
+             continue;
+         }
++        ++s_audio_tones;
+         TickType_t started = xTaskGetTickCount();
+         while (s_active && command.generation == s_buzzer_generation &&
+                !alarm_ring_is_active() && !voice_player_tts_is_active() &&
+@@ -951,6 +1178,13 @@ static int miniapp_lua_clock_now(lua_State *L)
+     return 1;
+ }
+ 
++static int miniapp_lua_clock_ms(lua_State *L)
++{
++    /* Monotonic uptime in milliseconds; wraps after ~49 days. */
++    lua_pushinteger(L, (lua_Integer)(xTaskGetTickCount() * portTICK_PERIOD_MS));
++    return 1;
++}
++
+ static int miniapp_lua_clock_localtime(lua_State *L)
+ {
+     struct tm calendar;
+@@ -1765,6 +1999,14 @@ static int miniapp_lua_audio_get_state(lua_State *L)
+     return 1;
+ }
+ 
++/* app.exit(): 请求退出当前小应用（回到语音待机）。只往事件队列投递，
++ * 真正的销毁在 miniapp 任务里做，Lua 侧不会在回调中途被拆掉。 */
++static int miniapp_lua_app_exit(lua_State *L)
++{
++    lua_pushinteger(L, miniapp_exit());
++    return 1;
++}
++
+ static void miniapp_open_safe_libraries(lua_State *L)
+ {
+     static const struct {
+@@ -1818,10 +2060,25 @@ static void miniapp_open_safe_libraries(lua_State *L)
+     miniapp_register_function(L, "buzzer", "play", miniapp_lua_buzzer_play);
+ #endif
+ 
++    lua_newtable(L);
++    lua_setglobal(L, "gpio");
++    miniapp_register_function(L, "gpio", "read", miniapp_lua_gpio_read);
++    lua_newtable(L);
++    lua_setglobal(L, "adc");
++    miniapp_register_function(L, "adc", "read", miniapp_lua_adc_read);
++
+     lua_newtable(L);
+     lua_setglobal(L, "clock");
+     miniapp_register_function(L, "clock", "now", miniapp_lua_clock_now);
++    miniapp_register_function(L, "clock", "ms", miniapp_lua_clock_ms);
+     miniapp_register_function(L, "clock", "localtime", miniapp_lua_clock_localtime);
++#ifdef CONFIG_MINIAPP_ADB_DEBUG
++    lua_newtable(L);
++    lua_setglobal(L, "debug");
++    miniapp_register_function(L, "debug", "log", miniapp_lua_debug_log);
++    miniapp_register_function(L, "debug", "input", miniapp_lua_debug_input);
++    miniapp_register_function(L, "debug", "knob", miniapp_lua_debug_knob);
++#endif
+     lua_newtable(L);
+     lua_setglobal(L, "storage");
+     miniapp_register_function(L, "storage", "load", miniapp_lua_storage_load);
+@@ -1859,6 +2116,7 @@ static void miniapp_open_safe_libraries(lua_State *L)
+     lua_pushinteger(L, MINIAPP_API_VERSION);
+     lua_setfield(L, -2, "api_version");
+     lua_setglobal(L, "app");
++    miniapp_register_function(L, "app", "exit", miniapp_lua_app_exit);
+ }
+ 
+ static void miniapp_hook(lua_State *L, lua_Debug *ar)
+diff --git a/apps/arcs-mini/miniapp/miniapp_ui.c b/apps/arcs-mini/miniapp/miniapp_ui.c
+index fc140dbf..4df7d610 100644
+--- a/apps/arcs-mini/miniapp/miniapp_ui.c
++++ b/apps/arcs-mini/miniapp/miniapp_ui.c
+@@ -296,6 +296,22 @@ int miniapp_ui_present(const miniapp_scene_t *scene)
+     return 0;
+ }
+ 
++/* Console diagnostics: copy the last presented scene so the screen content can be
++ * read over ADB (headless verification of what the user sees). */
++bool miniapp_ui_scene_snapshot(miniapp_scene_t *out)
++{
++    if (!out || !s_pending_scene || !s_scene_lock) {
++        return false;
++    }
++    xSemaphoreTake(s_scene_lock, portMAX_DELAY);
++    bool ok = s_scene_sequence != 0;
++    if (ok) {
++        miniapp_scene_copy(out, s_pending_scene);
++    }
++    xSemaphoreGive(s_scene_lock);
++    return ok;
++}
++
+ int miniapp_ui_wait_frame(uint32_t timeout_ms)
+ {
+     TickType_t start = xTaskGetTickCount();
+@@ -315,5 +331,6 @@ int miniapp_ui_init(void) { return 0; }
+ int miniapp_ui_open(void) { return 0; }
+ int miniapp_ui_close(void) { return 0; }
+ int miniapp_ui_present(const miniapp_scene_t *scene) { (void)scene; return -1; }
++bool miniapp_ui_scene_snapshot(miniapp_scene_t *out) { (void)out; return false; }
+ int miniapp_ui_wait_frame(uint32_t timeout_ms) { (void)timeout_ms; return 0; }
+ #endif
+diff --git a/src/shell/cmd/CMakeLists.txt b/src/shell/cmd/CMakeLists.txt
+index 93019d3f..cda9d1fe 100644
+--- a/src/shell/cmd/CMakeLists.txt
++++ b/src/shell/cmd/CMakeLists.txt
+@@ -5,6 +5,7 @@ listenai_library_sources(
+     ble.c
+     # fs.c
+     heap.c
++    hwtest.c
+     id_cmd.c
+     interact.c
+     kv.c
+@@ -16,6 +17,7 @@ listenai_library_sources(
+     sys.c
+     version.c
+     wifi.c
++    mcplist.c
+ )
+ 
+ listenai_library_sources_ifdef(CONFIG_CHERRYUSB_HOST_CDC_ACM usb_serial.c)
+diff --git a/src/shell/cmd/hwtest.c b/src/shell/cmd/hwtest.c
+new file mode 100644
+index 00000000..791c1c3b
+--- /dev/null
++++ b/src/shell/cmd/hwtest.c
+@@ -0,0 +1,216 @@
++/*
++ * hwtest.c - 扩展外设接线自检命令
++ *
++ * 用法:
++ *   hwtest btn  [count]   连读 PA1(gpioa pin1) 电平, 验证按钮
++ *   hwtest knob [count]   连读 PD4(exadc ch7) ADC, 验证旋钮
++ */
++
++#include "shell.h"
++#include <stdlib.h>
++#include <string.h>
++#include "FreeRTOS.h"
++#include "task.h"
++#include "lisa_gpio.h"
++#include "lisa_adc.h"
++#include "lisa_device.h"
++#include "IOMuxManager.h"
++
++/* 按钮: 扩展排针 PA01 -> 主 SoC gpioa pin1 (原 4G RST 功能) */
++#define HW_BTN_GPIO_DEV "gpioa"
++#define HW_BTN_PAD      CSK_IOMUX_PAD_A
++#define HW_BTN_PIN      1
++
++/* 旋钮: 扩展排针 PD4 -> CH32V003 exadc 通道 7 */
++#define HW_KNOB_ADC_DEV "exadc"
++#define HW_KNOB_ADC_CH  7
++
++#define HW_SAMPLE_MS     150
++#define HW_DEFAULT_COUNT 30
++#define HW_MAX_COUNT     500
++
++static int hwtest_btn(int argc, char **argv)
++{
++    Shell *shell = shellGetCurrent();
++    int count = HW_DEFAULT_COUNT;
++
++    if (argc >= 3) {
++        count = atoi(argv[2]);
++    }
++    if (count <= 0 || count > HW_MAX_COUNT) {
++        count = HW_DEFAULT_COUNT;
++    }
++
++    lisa_device_t *gpio = lisa_device_get(HW_BTN_GPIO_DEV);
++    if (!lisa_device_ready(gpio)) {
++        shellPrint(shell, "gpio device '%s' not ready\r\n", HW_BTN_GPIO_DEV);
++        return -1;
++    }
++
++    /* PA1 是 4G RST 功能，其 GPIO 复用功能号是 1（ALTER1），不是 FUNC_DEFAULT。
++     * 外接按键模块为「高电平有效」：松开 OUT 被下拉到低、按下输出高，故用输入下拉。 */
++    int32_t mux = IOMuxManager_PinConfigure(HW_BTN_PAD, HW_BTN_PIN, CSK_IOMUX_FUNC_ALTER1);
++    shellPrint(shell, "pinmux PA%d -> GPIO func1(ALTER1), ret=%d\r\n", HW_BTN_PIN, (int)mux);
++
++    int cfg = lisa_gpio_configure(gpio, HW_BTN_PIN, LISA_GPIO_CONFIG_INPUT_PULLDOWN);
++    shellPrint(shell, "configure PA%d input+pulldown, ret=%d\r\n", HW_BTN_PIN, cfg);
++
++    shellPrint(shell, "sampling PA%d every %dms x%d (press/release the button)\r\n", HW_BTN_PIN, HW_SAMPLE_MS,
++               count);
++
++    for (int i = 0; i < count; i++) {
++        int level = lisa_gpio_read_pin(gpio, HW_BTN_PIN);
++        if (level < 0) {
++            shellPrint(shell, "[%03d] PA%d read err=%d\r\n", i, HW_BTN_PIN, level);
++        } else {
++            shellPrint(shell, "[%03d] PA%d = %d  %s\r\n", i, HW_BTN_PIN, level,
++                       level == LISA_GPIO_LOW ? "(LOW / pressed)" : "(HIGH / released)");
++        }
++        vTaskDelay(pdMS_TO_TICKS(HW_SAMPLE_MS));
++    }
++    return 0;
++}
++
++static int hwtest_knob(int argc, char **argv)
++{
++    Shell *shell = shellGetCurrent();
++    int count = HW_DEFAULT_COUNT;
++
++    if (argc >= 3) {
++        count = atoi(argv[2]);
++    }
++    if (count <= 0 || count > HW_MAX_COUNT) {
++        count = HW_DEFAULT_COUNT;
++    }
++
++    lisa_device_t *adc = lisa_device_get(HW_KNOB_ADC_DEV);
++    if (!lisa_device_ready(adc)) {
++        shellPrint(shell, "adc device '%s' not ready\r\n", HW_KNOB_ADC_DEV);
++        return -1;
++    }
++
++    shellPrint(shell, "sampling exadc ch%d (PD4) every %dms x%d (turn the knob)\r\n", HW_KNOB_ADC_CH, HW_SAMPLE_MS,
++               count);
++
++    for (int i = 0; i < count; i++) {
++        uint16_t val = 0;
++        int ret = lisa_adc_read(adc, HW_KNOB_ADC_CH, &val);
++        if (ret != LISA_DEVICE_OK) {
++            shellPrint(shell, "[%03d] adc read err=%d\r\n", i, ret);
++        } else {
++            shellPrint(shell, "[%03d] ADC = %4u (0x%03X)\r\n", i, (unsigned)val, (unsigned)val);
++        }
++        vTaskDelay(pdMS_TO_TICKS(HW_SAMPLE_MS));
++    }
++    return 0;
++}
++
++static int hwtest_adc(int argc, char **argv)
++{
++    Shell *shell = shellGetCurrent();
++    int count = HW_DEFAULT_COUNT;
++
++    if (argc >= 3) {
++        count = atoi(argv[2]);
++    }
++    if (count <= 0 || count > HW_MAX_COUNT) {
++        count = HW_DEFAULT_COUNT;
++    }
++
++    lisa_device_t *adc = lisa_device_get(HW_KNOB_ADC_DEV);
++    if (!lisa_device_ready(adc)) {
++        shellPrint(shell, "adc device '%s' not ready\r\n", HW_KNOB_ADC_DEV);
++        return -1;
++    }
++
++    shellPrint(shell, "sampling all 8 exadc channels every %dms x%d\r\n", HW_SAMPLE_MS, count);
++
++    for (int i = 0; i < count; i++) {
++        shellPrint(shell, "[%03d] ", i);
++        for (int ch = 0; ch < 8; ch++) {
++            uint16_t val = 0;
++            int ret = lisa_adc_read(adc, (uint32_t)ch, &val);
++            if (ret == LISA_DEVICE_OK) {
++                shellPrint(shell, "ch%d=%4u ", ch, (unsigned)val);
++            } else {
++                shellPrint(shell, "ch%d=ERR ", ch);
++            }
++        }
++        shellPrint(shell, "\r\n");
++        vTaskDelay(pdMS_TO_TICKS(HW_SAMPLE_MS));
++    }
++    return 0;
++}
++
++static int hwtest_gpio(int argc, char **argv)
++{
++    Shell *shell = shellGetCurrent();
++    int count = HW_DEFAULT_COUNT;
++
++    if (argc >= 3) {
++        count = atoi(argv[2]);
++    }
++    if (count <= 0 || count > HW_MAX_COUNT) {
++        count = HW_DEFAULT_COUNT;
++    }
++
++    lisa_device_t *gpa = lisa_device_get("gpioa");
++    lisa_device_t *gpb = lisa_device_get("gpiob");
++    if (!lisa_device_ready(gpa) || !lisa_device_ready(gpb)) {
++        shellPrint(shell, "gpio device not ready\r\n");
++        return -1;
++    }
++
++    /* 4 个扩展口 GPIO：PA0/PA1 用 func1(ALTER1)+下拉；PB6/PB7 用 func0(DEFAULT)+下拉 */
++    IOMuxManager_PinConfigure(CSK_IOMUX_PAD_A, 0, CSK_IOMUX_FUNC_ALTER1);
++    lisa_gpio_configure(gpa, 0, LISA_GPIO_CONFIG_INPUT_PULLDOWN);
++    IOMuxManager_PinConfigure(CSK_IOMUX_PAD_A, 1, CSK_IOMUX_FUNC_ALTER1);
++    lisa_gpio_configure(gpa, 1, LISA_GPIO_CONFIG_INPUT_PULLDOWN);
++    IOMuxManager_PinConfigure(CSK_IOMUX_PAD_B, 6, CSK_IOMUX_FUNC_DEFAULT);
++    lisa_gpio_configure(gpb, 6, LISA_GPIO_CONFIG_INPUT_PULLDOWN);
++    IOMuxManager_PinConfigure(CSK_IOMUX_PAD_B, 7, CSK_IOMUX_FUNC_DEFAULT);
++    lisa_gpio_configure(gpb, 7, LISA_GPIO_CONFIG_INPUT_PULLDOWN);
++
++    shellPrint(shell, "sampling PA0/PA1/PB6/PB7 every %dms x%d (press button on ONE pin)\r\n",
++               HW_SAMPLE_MS, count);
++
++    for (int i = 0; i < count; i++) {
++        int a0 = lisa_gpio_read_pin(gpa, 0);
++        int a1 = lisa_gpio_read_pin(gpa, 1);
++        int b6 = lisa_gpio_read_pin(gpb, 6);
++        int b7 = lisa_gpio_read_pin(gpb, 7);
++        shellPrint(shell, "[%03d] PA0=%d PA1=%d PB6=%d PB7=%d\r\n", i, a0, a1, b6, b7);
++        vTaskDelay(pdMS_TO_TICKS(HW_SAMPLE_MS));
++    }
++    return 0;
++}
++
++static int cmd_hwtest(int argc, char **argv)
++{
++    Shell *shell = shellGetCurrent();
++
++    if (argc < 2) {
++        shellPrint(shell, "usage:\r\n");
++        shellPrint(shell, "  hwtest btn  [count]   sample PA1 button, default 30 times\r\n");
++        shellPrint(shell, "  hwtest knob [count]   sample PD4 knob ADC, default 30 times\r\n");
++        shellPrint(shell, "  hwtest adc  [count]   sample all 8 exadc channels, default 30 times\r\n");
++        shellPrint(shell, "  hwtest gpio [count]   sample PA0/PA1/PB6/PB7, default 30 times\r\n");
++        return -1;
++    }
++
++    if (strcmp(argv[1], "btn") == 0) {
++        return hwtest_btn(argc, argv);
++    } else if (strcmp(argv[1], "knob") == 0) {
++        return hwtest_knob(argc, argv);
++    } else if (strcmp(argv[1], "adc") == 0) {
++        return hwtest_adc(argc, argv);
++    } else if (strcmp(argv[1], "gpio") == 0) {
++        return hwtest_gpio(argc, argv);
++    }
++
++    shellPrint(shell, "unknown subcommand '%s'\r\n", argv[1]);
++    return -1;
++}
++
++SHELL_EXPORT_CMD(SHELL_CMD_PERMISSION(0) | SHELL_CMD_TYPE(SHELL_TYPE_CMD_MAIN) | SHELL_CMD_DISABLE_RETURN, hwtest,
++                 cmd_hwtest, "hwtest btn|knob - check external button/knob wiring");
+diff --git a/src/shell/cmd/mcplist.c b/src/shell/cmd/mcplist.c
+new file mode 100644
+index 00000000..9a4c61c6
+--- /dev/null
++++ b/src/shell/cmd/mcplist.c
+@@ -0,0 +1,48 @@
++#include "shell.h"
++#include "mcp.h"
++#include "cJSON.h"
++
++extern const struct mcp_tool __mcp_tool_start[];
++extern const struct mcp_tool __mcp_tool_end[];
++
++static int cmd_mcplist(int argc, char **argv)
++{
++    (void)argc;
++    (void)argv;
++    Shell *shell = shellGetCurrent();
++
++    int count = 0;
++    for (const struct mcp_tool *tool = __mcp_tool_start; tool < __mcp_tool_end; tool++) {
++        shellPrint(shell, "[section] %s\r\n", tool->name ? tool->name : "(null)");
++        count++;
++    }
++    shellPrint(shell, "section total=%d\r\n", count);
++
++    cJSON *msg = cJSON_Parse("{\"method\":\"tools/list\",\"id\":\"mcpdebug\"}");
++    if (!msg) {
++        shellPrint(shell, "parse failed\r\n");
++        return 0;
++    }
++    cJSON *resp = mcp_process(msg);
++    cJSON_Delete(msg);
++    if (!resp) {
++        shellPrint(shell, "mcp_process returned NULL\r\n");
++        return 0;
++    }
++    cJSON *result = cJSON_GetObjectItemCaseSensitive(resp, "result");
++    cJSON *tools = result ? cJSON_GetObjectItemCaseSensitive(result, "tools") : NULL;
++    int tcount = tools ? cJSON_GetArraySize(tools) : -1;
++    shellPrint(shell, "tools/list count=%d\r\n", tcount);
++    if (tools) {
++        cJSON *item = NULL;
++        cJSON_ArrayForEach(item, tools) {
++            cJSON *name = cJSON_GetObjectItemCaseSensitive(item, "name");
++            shellPrint(shell, "  [list] %s\r\n", name && name->valuestring ? name->valuestring : "(null)");
++        }
++    }
++    cJSON_Delete(resp);
++    return 0;
++}
++
++SHELL_EXPORT_CMD(SHELL_CMD_PERMISSION(0) | SHELL_CMD_TYPE(SHELL_TYPE_CMD_MAIN) | SHELL_CMD_DISABLE_RETURN, mcplist,
++                 cmd_mcplist, list all registered MCP tools);

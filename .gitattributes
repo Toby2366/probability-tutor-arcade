@@ -1,0 +1,15 @@
+# 先设全局规则，再为 Lua 单独覆盖（同一文件后面的规则优先）。
+* text=auto eol=lf
+
+# Lua 源码逐字节保留原样：设备里跑的就是这几个字节，行尾转换会让
+# 生成进固件的 md5 与仓库对不上。必须放在 * 规则之后才能生效。
+*.lua   -text
+
+*.md    text eol=lf
+*.py    text eol=lf
+*.cjs   text eol=lf
+*.json  text eol=lf
+*.patch text eol=lf
+
+*.bin   binary
+*.lpk   binary

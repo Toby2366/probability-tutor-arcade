@@ -1,0 +1,14 @@
+{
+  "name": "arcs-mini-arcade-tools",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Headless regression harness for Arcs Mini arcade Lua apps",
+  "scripts": {
+    "sim": "node sim_arcade.cjs ../apps/arcade.lua",
+    "sim:dice": "node sim_dice.cjs ../apps/dice.lua",
+    "gen": "python gen_builtin.py --src ../apps"
+  },
+  "dependencies": {
+    "fengari": "^0.1.5"
+  }
+}
