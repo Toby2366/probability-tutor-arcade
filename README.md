@@ -8,8 +8,28 @@
 
 ---
 
+## 效果
+
+<table>
+  <tr>
+    <td><img src="docs/images/snake.jpg" width="230" alt="贪吃蛇"></td>
+    <td><img src="docs/images/dice.jpg" width="230" alt="掷骰子"></td>
+    <td><img src="docs/images/coin.jpg" width="230" alt="掷硬币"></td>
+  </tr>
+  <tr>
+    <td align="center">贪吃蛇（像素级连续移动）</td>
+    <td align="center">掷骰子（抖动 + 滚动乐谱）</td>
+    <td align="center">掷硬币（频率统计）</td>
+  </tr>
+</table>
+
+> 图为原型机：白色外壳 + 3D 打印扩展板（方向键、功能键、旋钮），杜邦线接到主控排针。
+
+---
+
 ## 目录
 
+- [效果](#效果)
 - [它能做什么](#它能做什么)
 - [为什么需要这些固件补丁](#为什么需要这些固件补丁)
 - [硬件与运行环境](#硬件与运行环境)
