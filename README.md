@@ -2,11 +2,11 @@
 
 对着掌机说"掷个骰子"，助教**小概**会先讲两句直觉，再把小游戏直接拉到屏幕上；退出游戏，接着聊概念。
 
-一套跑在 **聆思 Arcs Mini3**（240×240 圆屏）上的：语音概率论助教 + 12 个画面的 Lua 小游戏与教学实验，外加一层让"声音、画面、按键"真正好用的固件增强。
+一套跑在 **聆思 Arcs Mini3**（240×240 圆屏）上的：语音概率论助教 + 13 个画面的 Lua 小游戏与教学实验，外加一层让"声音、画面、按键"真正好用的固件增强。
 
 > **非官方项目**，与聆思（ListenAI）无隶属关系，仅为适配 Arcs Mini3 平台而开发。
 >
-> An unofficial probability-tutor + mini-game collection for the ListenAI Arcs Mini3 handheld (240×240 round LCD): 12 Lua scenes, 26 procedural SFX scores, and firmware patches adding a 4-voice synth binding, `app.exit()`, and on-device screen/key/glyph/audio inspection commands.
+> An unofficial probability-tutor + mini-game collection for the ListenAI Arcs Mini3 handheld (240×240 round LCD): 13 Lua scenes, 26 procedural SFX scores, and firmware patches adding a 4-voice synth binding, `tts.speak()`, `app.exit()`, and on-device screen/key/glyph/audio inspection commands.
 
 ---
 
@@ -80,12 +80,15 @@
 │   ├── 掷硬币        正反累计、大数定律可视化
 │   ├── 高尔顿板      小球下落、撞钉、入槽形成直方图
 │   ├── 频率收敛      理论概率 vs 实测频率曲线
+│   ├── 蒲丰投针      投针算圆周率；双视图看"交不交"和"怎么逼近 3.1416"
 │   ├── 蒙提霍尔      三扇门，可换门；跑一批实验看换门胜率
 │   └── 二项分布      n/p 可调，柱状图与理论值对照
 ├── 平衡挑战          旋钮反向补偿，杆越斜倒得越快
 ├── 打靶              5 发，每发准星随机落点，旋钮微调
 └── 2048              4×4 合并，达成 2048 有专属旋律
 ```
+
+**进游戏会念一段玩法说明**。基于运行时的 `tts.speak()`：异步、不阻塞，播报期间手照样能按，讲完自动恢复游戏音效。
 
 ---
 
@@ -96,7 +99,8 @@
 | 场景 | 操作 | 关键实现 |
 |---|---|---|
 | 贪吃蛇 | ↑↓←→ 转向 | 像素级连续移动（不是整格跳），转向当帧生效；体节按轨迹等距铺开 |
-| 概率实验室 | ↑↓ 选项，→ 进入 | 6 个统计/概率小实验共用一套菜单与返回栈 |
+| 概率实验室 | ↑↓ 选项，→ 进入 | 7 个统计/概率小实验共用一套菜单与返回栈 |
+| 蒲丰投针 | ↑投 1 根、↓投 10 根、←切旋钮参数、→换视图 | 红=扎到平行线、蓝=没扎到；旋钮调针长/线距；视图 2 是 π 的收敛折线（黄线 3.1416）。一帧图元有限，屏上只画最近 160 根，`共 N` 照常累加 |
 | 平衡挑战 | 旋钮 | 按**秒**积分（`acc = off*300 + 噪声1100`），不操作约 20 秒落杆；分数 = 存活 0.1 秒 |
 | 打靶 | 旋钮微调 + → 发射 | 每发准星在 44..196 随机重置，旋钮做**相对**微调，落点带 ±11px 抖动；10/8/6/4/2 环 |
 | 2048 | ↑↓←→ 滑动 | 44px 格 + 4px 间距，按合并值升调的音效，无路可走才判负 |
@@ -125,14 +129,16 @@
 
 | 信号 | 引脚 |
 |---|---|
-| ↑ | PA0（高有效） |
-| ← | PA1（高有效） |
-| ↓ | PB7（高有效） |
-| → | PB6（高有效） |
+| ↑ | PB7（高有效） |
+| ↓ | PA0（高有效） |
+| ← | PB6（高有效） |
+| → | PA1（高有效） |
 | 旋钮 | PD4 → `exadc` ch7，0..1023 |
 | 屏幕 | 240×240，Lua 侧 `app.width/height = 240` |
 | 字体 | `lv_font_chinese_16.bin`，1bpp，cmap 含 U+2190..U+2199 箭头 |
 | 基础固件 | 聆思 arc SDK `mini-v3.1.0` 分支 |
+
+> 引脚和外壳上的丝印顺序是交叉的（上=PB7、下=PA0），早期版本按丝印顺序写，结果"按上出下、按左出右"。以上是 2026-11 按实测改正后的映射；如果你照自己的接线改过，只需同步 [`apps/hwtest.lua`](apps/hwtest.lua) 与 `mcp_tool_miniapp_builtin.c` 里的 `miniapp key` 映射。
 | Lua 方言 | 精简 Lua：无 `pcall`，`screen.*` 只收整数 |
 
 ---
@@ -147,11 +153,13 @@
 | 小应用无法主动退出 | 只能靠外部命令停掉 | 绑定 `app.exit()`，投递 `MINIAPP_EVENT_EXIT`（不在回调里拆 VM） |
 | 屏幕内容看不见 | 只能靠肉眼判断渲染对不对 | `miniapp screen` 把最近一帧结构化打印出来 |
 | 按键/字形没法验证 | 只能猜引脚或字体有没有 | `miniapp key <dir> <0\|1>` 注入按键、`miniapp glyph <hex>` 查 cmap |
-| 音频是否真的播完 | Lua 没报错 ≠ 出声 | `miniapp audio` 输出播完段数、音符数、最近一段时长、是否正在播 |
+| 音频是否真的播完 | Lua 没报错 ≠ 出声 | `miniapp audio` 输出播完段数、音符数、最近一段时长、是否正在播；第二行是 TTS 的请求数/成功数/最近状态 |
+| 小应用想主动说话 | 只有对话链路，游戏里没法念玩法 | 暴露 `tts.speak(text)`（异步、不阻塞，结果走 `on_tts_result(id, {...})`），并加 `MINIAPP_TTS_MAX_PENDING = 1` 的单请求排队 |
 | 一帧文字上限 16 | 2048 需要 16 格数字，加上分数就超 | `MINIAPP_MAX_TEXTS` 16 → 32 |
 | Lua 堆偏小 | 大源码 + 双 VM 回滚时紧张 | `MINIAPP_HEAP_MAX_BYTES` 默认 384KB → 512KB |
+| 源码上限 64KB | `arcade.lua` 涨到 72KB 时安装失败 | `MINIAPP_SOURCE_MAX_BYTES` 默认 64KB → 96KB（上限 128KB） |
 
-补丁共 10 个文件、约 1200 行，全部围绕 `apps/arcs-mini/miniapp/`、`apps/arcs-mini/mcp-tools/` 和 `src/shell/cmd/`。
+补丁共 10 个文件、约 1300 行，全部围绕 `apps/arcs-mini/miniapp/`、`apps/arcs-mini/mcp-tools/` 和 `src/shell/cmd/`。
 
 ---
 
@@ -216,12 +224,12 @@ adb -s BOOT-<serial> shell reboot hard
 改 Lua 最痛的是"烧进去才发现崩了"。`tools/sim_arcade.cjs` 用 fengari 跑真实源码，假屏幕**严格复刻 C 层校验**——整数、`w/h>=1`、矩形不越界、`text` 的 y≤224、一帧 32 条文字上限：
 
 ```sh
-cd tools && npm install fengari
+cd tools && npm install          # 只装 fengari；有 package-lock 时可用 npm ci
 node sim_arcade.cjs ../apps/arcade.lua
 node sim_dice.cjs  ../apps/dice.lua
 ```
 
-它对 12 个页面做「旋钮全量程 + 随机按键 80 帧」压力测试。这一层直接抓到过两个真机崩溃：平衡挑战的浮点参数、打靶弹孔的 `h.x-2`。
+它对 13 个页面做「旋钮全量程 + 随机按键 80 帧」压力测试。这一层直接抓到过两个真机崩溃：平衡挑战的浮点参数、打靶弹孔的 `h.x-2`。
 
 ### 设备端自检命令
 
@@ -231,9 +239,9 @@ miniapp run <id>            启动
 miniapp status              帧数、掉帧、最大帧耗时、last_error
 miniapp key <dir> <0|1>     注入按键（up/down/left/right）
 miniapp btn                 模拟侧键单击
-miniapp screen              打印最近一帧的全部图形与文字
+miniapp screen              打印最近一帧的图形与文字（图元 >64 个时只打末尾 32 条，好让折线末端不被截断）
 miniapp glyph <hex...>      查字形位图与步进（如 2190 2191 2192 2193）
-miniapp audio               合成器遥测：播完段数/音符数/最近时长/是否在播
+miniapp audio               合成器遥测：播完段数/音符数/最近时长/是否在播；第二行是 TTS 请求数/成功数/最近状态
 ```
 
 `miniapp screen` + `miniapp audio` 的组合，让"画面对不对、声音出没出"都能在 headless 的 ADB 会话里验证，不用盯着屏幕。
@@ -263,7 +271,8 @@ gun = {                       -- 枪声：噪声爆音 + 低频冲击 + 余震
 
 ## 已知限制
 
-- **源码上限 64KB**：`arcade.lua` 已 53.8KB，再加内容要留意；文字一帧 32 条也接近上限。
+- **源码上限 96KB**：`arcade.lua` 已 72KB（Kconfig 默认值已从 64KB 调到 96KB），再加内容要留意；文字一帧 32 条也接近上限。
+- **一帧最多 256 个图元**：蒲丰投针因此屏上只画最近 160 根针，统计仍按全部针数算，屏幕用 `共 N` 标出总数——不是针丢了，是画不下。
 - **旋钮是电位器不是编码器**：270° 机械行程、无档位，读不到"转了几格"，所有旋钮交互都要自己做基线与相对量。
 - **无 `pcall`**：设备端 Lua 不给 `pcall`，任何可能越界的参数都得在调用前夹取，否则直接抛错中断安装。
 - **仿真器不是真机**：屏幕校验逻辑照抄 C，但时序、字体渲染、音频输出仍需真机确认。
