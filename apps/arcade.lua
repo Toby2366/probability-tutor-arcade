@@ -5,7 +5,8 @@
 -- 返回：任意页面单击板载侧键（功能键）= 返回上一级；主菜单上 = 退出小应用。
 --       每个页面右下/右上角都印了「侧键 返回」提示。
 --
--- 方向键（gpio.read 轮询）：↑=PA0 ↓=PB7 ←=PA1 →=PB6，高电平有效
+-- 方向键（gpio.read 轮询）：↑=PB7 ↓=PA0 ←=PB6 →=PA1，高电平有效
+--       注：早期版本把四根线接反了（按上出下、按左出右），2026-11 按实测改正
 -- 屏幕上统一用 ↑↓←→ 显示（lv_font_chinese_16 含 U+2190..2199 字形）
 -- 旋钮：adc.read(7) 输出 0~1023（PD4 = CH32V003 ADC ch7）
 --
@@ -220,7 +221,9 @@ S.gun_miss  = join_score(S.gun, S.miss, 170)
 -- 播放节流：固件音频队列只有 4 格，满了直接丢；同一声效太密也没意义。
 local now_ms = 0
 local sfx_last = {}
+local intro_until = 0            -- 小白在讲话时先不发音效（会盖住人声）
 local function play_sfx(name, gap)
+    if intro_until > now_ms then return end
     local notes = S[name]
     if not notes then return end
     gap = gap or 60
@@ -238,6 +241,96 @@ local function play_sfx(name, gap)
     beep(notes[1].hz, notes[1].ms)   -- 没有合成器时退回单音
 end
 
+-- ================= 小白讲玩法（TTS）=================
+-- 运行时暴露 tts.speak(text)（见 docs/miniapp.md「文本播报」）：异步、不阻塞，
+-- 结果走全局回调 on_tts_result(id, {status=...})，失败带 error.code。
+-- 所以进游戏的瞬间念一段说明，手照样能按；播报期间把合成器音效静音，
+-- 免得“嘟嘟”声盖住人声，讲完自动恢复（intro_until 是兜底计时）。
+-- 文本上限 512 字节（中文 3 字节/字），下面每段都远低于这个数。
+local INTRO = {
+    snake    = "贪吃蛇。方向键转向，吃红点会变长，撞墙或撞到自己就结束。",
+    balance  = "平衡挑战。小球会自己往两边跑，转旋钮把它掰回来，越快越难。",
+    target   = "打靶。旋钮微调准星，按右键开枪，越靠靶心环数越高。",
+    g2048    = "二零四八。方向键滑动方块，相同数字合并，凑出二零四八。",
+    dice     = "掷骰子。按右键掷一颗，看每个点数出现的次数。",
+    coin     = "掷硬币。按右键抛一次，统计正面和反面的次数。",
+    galton   = "高尔顿板。小球每层随机往左或往右，落下来堆成钟形曲线。",
+    converge = "频率收敛。一直投硬币，正面出现的频率会稳定在百分之五十。",
+    monty    = "蒙提霍尔。三扇门后一车两羊。你先选一扇，主持人开一扇羊门，再决定换不换。",
+    binom    = "二项分布。旋钮调成功率，左右键改试验次数，看柱子怎么变。",
+    buffon   = "蒲丰投针。针随机落在平行线上，相交的比例能算出圆周率。上键投一根，下键投十根，右键看圆周率怎么逼近真值。屏幕上只画最近一批针，总数照常累加。",
+}
+
+local intro_id = 0
+local intro_pending = nil      -- 待念的场景名（连翻几页时只念最后一段）
+local intro_busy = false       -- 上一条请求还没交付结果
+local intro_deadline = 0
+local intro_timeouts = 0       -- 连续几次没回包（>=2 就本次运行不再念）
+
+local intro_flush
+
+local function intro_speak(name)
+    local text = INTRO[name]
+    if not text then return nil end
+    if pcall then
+        local ok, id = pcall(tts.speak, text)
+        if ok then return id end
+        return nil
+    end
+    return tts.speak(text)
+end
+
+-- 运行时同时只允许一条播报（再多会直接抛 "too many pending TTS results"，
+-- 设备上的精简 Lua 没有 pcall 兜不住），所以这里自己排队：
+-- 新的一段进来先 cancel 旧的，等旧的结果回调交付后再念新的。
+local function intro_say(name)
+    if not tts or not tts.speak then return end
+    if not INTRO[name] then
+        -- 回到菜单：这一段不用再念了
+        intro_pending = nil
+        if intro_busy and intro_id ~= 0 and tts.cancel then
+            if pcall then pcall(tts.cancel, intro_id) else tts.cancel(intro_id) end
+        end
+        return
+    end
+    intro_pending = name
+    if intro_busy then
+        if intro_id ~= 0 and tts.cancel then
+            if pcall then pcall(tts.cancel, intro_id) else tts.cancel(intro_id) end
+        end
+    else
+        intro_flush()
+    end
+end
+
+intro_flush = function()
+    if intro_busy or intro_pending == nil then return end
+    -- 这台机器的语音服务连续两次没回包：本次运行不再念，
+    -- 免得每进一个游戏都要白等 20 秒静音
+    if intro_timeouts >= 2 then
+        intro_pending = nil
+        return
+    end
+    local name = intro_pending
+    intro_pending = nil
+    local id = intro_speak(name)
+    if not id then return end
+    intro_id = id
+    intro_busy = true
+    intro_deadline = now_ms + 20000      -- 回调万一丢了，20s 后自己放开
+    -- 240ms/字 是这台机器上的语速，加 700ms 收尾；正常会被回调提前清掉
+    intro_until = now_ms + math.floor(#INTRO[name] / 3) * 240 + 700
+end
+
+function on_tts_result(id, res)
+    if id ~= intro_id then return end
+    intro_id = 0
+    intro_busy = false
+    intro_until = 0
+    -- 只要有一条正常交付，就说明语音服务是好的，把超时计数清掉
+    if res and res.status == "completed" then intro_timeouts = 0 end
+end
+
 -- ================= 输入：方向键轮询 + 旋钮 =================
 local keys = { up = false, down = false, left = false, right = false }
 local keys_prev = { up = false, down = false, left = false, right = false }
@@ -248,10 +341,11 @@ local function read_input()
     keys_prev.down = keys.down
     keys_prev.left = keys.left
     keys_prev.right = keys.right
-    keys.up    = (gpio.read("a", 0) == 1)  -- PA0 = W 上
-    keys.left  = (gpio.read("a", 1) == 1)  -- PA1 = A 左
-    keys.down  = (gpio.read("b", 7) == 1)  -- PB7 = S 下
-    keys.right = (gpio.read("b", 6) == 1)  -- PB6 = D 右
+    -- 引脚与丝印方向是交叉的：实测按「上」键读到的是 PB7，按「下」键读到 PA0。
+    keys.up    = (gpio.read("b", 7) == 1)  -- PB7 = 上
+    keys.down  = (gpio.read("a", 0) == 1)  -- PA0 = 下
+    keys.left  = (gpio.read("b", 6) == 1)  -- PB6 = 左
+    keys.right = (gpio.read("a", 1) == 1)  -- PA1 = 右
     -- 第一帧引脚刚从复用功能切到 GPIO，可能读到瞬时高电平。
     -- 只把它当基线，不产生“按下”边沿，否则开局会自己跳一格。
     if not input_based then
@@ -269,20 +363,34 @@ end
 -- 旋钮增量（菜单导航用，过滤微抖，累计有效旋转）
 local knob_prev = nil
 local knob_acc = 0
+local knob_warm = 0
 local function knob_step()
     local v = adc.read(7)
-    if knob_prev == nil then knob_prev = v; knob_acc = 0; return 0 end
+    -- exadc 走 I2C 桥，偶发读失败会返回负数；不当真，否则一次 -1 就能算出 -614 的跳变
+    if not v or v < 0 or v > 1023 then return 0 end
+    -- 刚切场景时头几个采样可能是上一次的残留值，先取几次当基线
+    if knob_prev == nil or knob_warm < 3 then
+        knob_warm = knob_warm + 1
+        knob_prev = v
+        knob_acc = 0
+        return 0
+    end
     local d = v - knob_prev
     knob_prev = v
-    if math.abs(d) < 4 then return 0 end
+    if math.abs(d) > 300 then knob_acc = 0; return 0 end   -- 跳变：当作重新落位，不算旋转
+    -- 电位器静止时实测抖动 ±3（连读三次 613/608/611）。门槛放到 8，
+    -- 否则随机游走几秒就能凑出一次"假旋转" —— 在蒲丰投针里会直接把统计清零。
+    if math.abs(d) < 8 then return 0 end
     knob_acc = knob_acc + d
-    local TH = 220
-    if knob_acc >= TH then knob_acc = knob_acc - TH; return 1 end
-    if knob_acc <= -TH then knob_acc = knob_acc + TH; return -1 end
+    local TH = 200
+    if knob_acc >= TH then knob_acc = 0; return 1 end
+    if knob_acc <= -TH then knob_acc = 0; return -1 end
     return 0
 end
 local function knob_raw()
-    return adc.read(7)
+    local v = adc.read(7)
+    if not v or v < 0 or v > 1023 then return knob_prev or 512 end
+    return v
 end
 
 -- ================= 场景状态机 =================
@@ -293,8 +401,10 @@ local function set_scene(name)
     scene = name
     knob_prev = nil
     knob_acc = 0
+    knob_warm = 0
     local s = SCENES[name]
     if s and s.init then s.init() end
+    intro_say(name)      -- 进游戏就念一段玩法，念的同时手能继续操作
 end
 
 -- ================= 菜单 icon（矩形/圆简单绘制） =================
@@ -362,15 +472,23 @@ local function make_menu(items, title, back)
             screen.rect(0, (i - 1) * 40, W, 40, BG_GRAD[i])
         end
         screen.text(m.title, 8, 5, TITLE)
-        local item_h = (#m.items <= 5) and 36 or 30
-        local y0 = 32
+        -- 7 项时（概率实验室）单列 30px 会顶到返回提示，改用 25px 紧凑行 + 色块代替图标
+        local n = #m.items
+        local compact = (n > 6)
+        local item_h = (n <= 5) and 36 or (compact and 25 or 30)
+        local y0 = compact and 30 or 32
         for i, it in ipairs(m.items) do
             local y = y0 + (i - 1) * item_h
             if i == m.sel then
-                screen.rect(4, y, 232, item_h - 2, 0x2A3A5A)
+                screen.rect(4, y, 232, item_h - 1, 0x2A3A5A)
             end
-            draw_icon(it.scene, 14, y + 4)
-            screen.text(it.name, 56, y + 6, (i == m.sel) and TITLE or TEXT)
+            if compact then
+                screen.rect(16, y + 6, 6, 13, (i == m.sel) and YELLOW or 0x3A4A66)
+                screen.text(it.name, 32, y + 4, (i == m.sel) and TITLE or TEXT)
+            else
+                draw_icon(it.scene, 14, y + 4)
+                screen.text(it.name, 56, y + 6, (i == m.sel) and TITLE or TEXT)
+            end
         end
         -- 底部：左侧选择/确认键位，右侧侧键（主菜单上=退出，子菜单上=返回）
         screen.text("↑↓选择 →确认", 8, 222, DIM)
@@ -414,6 +532,7 @@ local MENU_PROB = {
     { name = "掷硬币",    scene = "coin" },
     { name = "高尔顿板",  scene = "galton" },
     { name = "频率收敛",  scene = "converge" },
+    { name = "蒲丰投针",  scene = "buffon" },
     { name = "蒙提霍尔",  scene = "monty" },
     { name = "二项分布",  scene = "binom" },
 }
@@ -1151,9 +1270,283 @@ end
 
 SCENES.converge = { init = init_converge, update = update_converge, draw = draw_converge }
 
+-- ================= 概率实验室：蒲丰投针 =================
+-- 长 L 的针随机落进间距 D 的平行线，理论上相交概率 P = 2L/(πD)。
+-- 反过来用实测相交率反推圆周率：π ≈ 2·L·N / (D·C)   （N=总针数，C=相交数）
+-- 两个视图（→ 切换）：
+--   1) 平行线与针：相交画红、不交画蓝 —— “交不交”本身要能一眼看出来
+--   2) 收敛曲线：横轴是投针次数，纵轴就是每投一根之后算出来的圆周率，
+--      黄线是 3.1416 —— 投得越多，曲线越贴着它，这才是大数定律该有的画面
+-- 按键：↑投 1 根、↓投 10 根、←切换旋钮调哪个参数、→切换视图、侧键返回。
+local BF_X0, BF_X1 = 10, 230
+local BF_Y0, BF_Y1 = 58, 184          -- 板面 120x126
+local BF_PI = 3.14159265
+local BF_L = { 14, 20, 26, 32, 38, 44, 50, 56 }   -- 针长候选（px）
+local BF_D = { 30, 35, 40, 45, 50, 60 }           -- 线距候选（px）
+
+-- 收敛曲线图的绘图区与纵轴范围（纵轴放宽一点，好让前几根针那些离谱的估计也看得见）
+local BF_CX0, BF_CX1 = 34, 230
+local BF_CY0, BF_CY1 = 56, 176
+local BF_VMIN, BF_VMAX = 2.20, 4.20
+local BF_HIST_MAX = 500                -- 曲线点上限，超了就隔一个丢一个（横向只画 66 列，再多也看不出来）
+-- 一帧最多 256 个图元：板面 1 + 平行线最多 5 + 文字 6，留给针的约 240 条。
+-- 取 160 是留余量（针太长或线太密时也不会顶到上限），
+-- 超了就把最旧的针挪走 —— 屏上永远是“最近的一把”，统计仍按全部针数算。
+local BF_SHOW_MAX = 160
+
+local buffon = { view = 1, knob = 1, li = 4, di = 4, n = 0, c = 0, needles = {}, hist = {} }
+
+local function buffon_reset()
+    buffon.n = 0
+    buffon.c = 0
+    buffon.needles = {}
+    buffon.hist = {}
+end
+
+-- 估计值 → 曲线图上的 y 像素。投针时就把每点的 r（sqrt(次数)）和 py 一起算好存下：
+-- 这两样只跟这一根针有关，每帧重算 900 次会把一帧拖到 100ms 以上（曲线视图实测值）。
+local function chart_py(v)
+    if v < BF_VMIN then v = BF_VMIN elseif v > BF_VMAX then v = BF_VMAX end
+    return math.floor(BF_CY1 - (v - BF_VMIN) / (BF_VMAX - BF_VMIN) * (BF_CY1 - BF_CY0) + 0.5)
+end
+
+-- 针尖会越出板面，按 y 裁掉；平行线是横线，裁 y 不改变是否相交
+local function bf_clip(x1, y1, x2, y2)
+    if y1 < BF_Y0 and y2 ~= y1 then
+        local t = (BF_Y0 - y1) / (y2 - y1)
+        x1, y1 = x1 + t * (x2 - x1), BF_Y0
+    elseif y1 > BF_Y1 and y2 ~= y1 then
+        local t = (BF_Y1 - y1) / (y2 - y1)
+        x1, y1 = x1 + t * (x2 - x1), BF_Y1
+    end
+    if y2 < BF_Y0 and y1 ~= y2 then
+        local t = (BF_Y0 - y2) / (y1 - y2)
+        x2, y2 = x2 + t * (x1 - x2), BF_Y0
+    elseif y2 > BF_Y1 and y1 ~= y2 then
+        local t = (BF_Y1 - y2) / (y1 - y2)
+        x2, y2 = x2 + t * (x1 - x2), BF_Y1
+    end
+    return x1, y1, x2, y2
+end
+
+local function buffon_throw(count)
+    local L = BF_L[buffon.li]
+    local D = BF_D[buffon.di]
+    local h = L / 2
+    local m = math.floor((BF_Y1 - BF_Y0) / D)
+    if m < 1 then m = 1 end
+    local span = m * D          -- 板内正好是 m 个完整线距，落点在这个区间里才是均匀的
+    for i = 1, count do
+        local a = rnd() * BF_PI
+        local cx = 10 + h + rnd() * (220 - 2 * h)
+        local cy = BF_Y0 + rnd() * span
+        local dx = math.cos(a) * h
+        local dy = math.sin(a) * h
+        -- 针覆盖的 y 区间里有没有 k 使 y = Y0 + k*D
+        local lo = math.ceil((cy - math.abs(dy) - BF_Y0) / D)
+        local hi = math.floor((cy + math.abs(dy) - BF_Y0) / D)
+        local cross = (hi >= lo)
+        buffon.n = buffon.n + 1
+        if cross then buffon.c = buffon.c + 1 end
+        -- 端点（含越界裁剪）在这里算一次就固定了：板面和 L/D 不变时针不会动，
+        -- 每帧再裁 160 次纯属白烧 CPU（实测帧耗时 5ms -> 35ms 就是这么来的）
+        local ax, ay, bx, by = bf_clip(cx - dx, cy - dy, cx + dx, cy + dy)
+        buffon.needles[#buffon.needles + 1] = {
+            ax = ax, ay = ay, bx = bx, by = by,
+            cross = cross, col = cross and RED or BLUE,
+        }
+        -- 收敛曲线的采样点：前 4 根针的估计值毫无意义（可能几十），不入图。
+        -- r / py 一起存：曲线每帧要画的点不变，没必要每帧重算 900 次开方和映射
+        if buffon.c > 0 and buffon.n >= 4 then
+            local hist = buffon.hist
+            local v = 2 * L * buffon.n / (D * buffon.c)
+            hist[#hist + 1] = { n = buffon.n, r = math.sqrt(buffon.n), py = chart_py(v) }
+        end
+    end
+    -- 一帧画不下所有针：屏上只留最近 BF_SHOW_MAX 根，统计仍按全部算。
+    -- 一次投十根时逐个 table.remove 是 O(n²) 的搬运，直接重建末尾这一截更省。
+    local nd = buffon.needles
+    local over = #nd - BF_SHOW_MAX
+    if over > 0 then
+        local keep = {}
+        for i = over + 1, #nd do keep[#keep + 1] = nd[i] end
+        buffon.needles = keep
+    end
+    -- 曲线点太多就隔一个丢一个：形状不变，内存和每帧遍历量都可控
+    if #buffon.hist > BF_HIST_MAX then
+        local hist = buffon.hist
+        local thin = {}
+        for i = 1, #hist - 1, 2 do thin[#thin + 1] = hist[i] end
+        thin[#thin + 1] = hist[#hist]
+        buffon.hist = thin
+    end
+    play_sfx("drop", 0)
+end
+
+local function init_buffon()
+    buffon.view = 1
+    buffon.knob = 1
+    buffon.li = 4
+    buffon.di = 4
+    buffon_reset()
+    buffon_throw(12)          -- 先撒一把，进来就有东西看
+end
+
+-- 视图 1：平行线与针。相交红、不交蓝
+local function draw_buffon_board(L, D)
+    local m = math.floor((BF_Y1 - BF_Y0) / D)
+    if m < 1 then m = 1 end
+    -- 板面 + 平行线
+    screen.rect(BF_X0, BF_Y0, BF_X1 - BF_X0, BF_Y1 - BF_Y0, 0x1B263D)
+    for k = 0, m do
+        local y = BF_Y0 + k * D
+        screen.line(BF_X0, y, BF_X1, y, 0x3A4A66)
+    end
+    -- 针：红 = 与某条线相交，蓝 = 没相交（端点和颜色都是投针时算好的）
+    for i = 1, #buffon.needles do
+        local nd = buffon.needles[i]
+        screen.line(nd.ax, nd.ay, nd.bx, nd.by, nd.col)
+    end
+end
+
+-- 视图 2：圆周率的收敛过程
+-- 横向用平方根压缩代替对数刻度：前几十根针铺得开、后面积累的挤在右边，
+-- 恰好是“先乱跳、后贴线”的样子；纵轴固定 2.2~4.2，黄线就是 3.1416。
+
+local function draw_buffon_chart()
+    local hist = buffon.hist
+    screen.rect(BF_CX0, BF_CY0, BF_CX1 - BF_CX0, BF_CY1 - BF_CY0, 0x141D2E)
+    -- 上下边界 + 3.1416 真值参考线
+    screen.rect(BF_CX0, BF_CY0, BF_CX1 - BF_CX0, 1, 0x2A3A5A)
+    screen.rect(BF_CX0, BF_CY1, BF_CX1 - BF_CX0, 1, 0x2A3A5A)
+    local yref = chart_py(BF_PI)
+    screen.rect(BF_CX0, yref, BF_CX1 - BF_CX0, 1, YELLOW)
+    -- 纵轴刻度只标两端，中间那条黄线就是真值（标题行已写 3.1416）
+    screen.text("4.2", 2, BF_CY0 - 2, DIM)
+    screen.text("2.2", 2, BF_CY1 - 12, DIM)
+
+    local total = buffon.n
+    if total < 4 or #hist == 0 then
+        screen.text("再多投几根", 92, 110, DIM)
+        return
+    end
+    local root = math.sqrt(total)
+    if root < 1 then root = 1 end
+    local scale = (BF_CX1 - BF_CX0) / root
+    -- 每一列只留最新的一根针，避免同一列反复覆盖把曲线画脏
+    local cols = {}
+    for i = 1, #hist do
+        local p = hist[i]
+        local px = math.floor(BF_CX0 + p.r * scale + 0.5)
+        if px < BF_CX0 then px = BF_CX0 elseif px > BF_CX1 then px = BF_CX1 end
+        cols[px] = p.py
+    end
+    -- 隔 3px 取一列连成折线：约 66 段，稳稳低于一帧的图形预算
+    local prevx, prevy, lastx, lasty
+    for px = BF_CX0, BF_CX1, 3 do
+        local py
+        for q = px + 2, px, -1 do
+            if py == nil then py = cols[q] end
+        end
+        if py ~= nil then
+            if prevx ~= nil then
+                screen.line(prevx, prevy, px, py, 0x4A90E2)
+            end
+            prevx, prevy, lastx, lasty = px, py, px, py
+        end
+    end
+    -- 最新的一点用红色点亮，对应标题行那个圆周率估计
+    if lastx ~= nil then
+        screen.rect(lastx - 1, lasty - 1, 3, 3, RED)
+    end
+end
+
+local function draw_buffon()
+    screen.begin(BG)
+    for i = 1, 6 do
+        screen.rect(0, (i - 1) * 40, W, 40, BG_GRAD[i])
+    end
+    screen.text("蒲丰投针", 8, 2, TITLE)
+    hint_back(164, 2)
+
+    local L = BF_L[buffon.li]
+    local D = BF_D[buffon.di]
+
+    if buffon.view == 1 then
+        draw_buffon_board(L, D)
+    else
+        draw_buffon_chart()
+    end
+
+    local est = "----"
+    if buffon.c > 0 then
+        est = string.format("%.3f", 2 * L * buffon.n / (D * buffon.c))
+    end
+    screen.text("圆周率 " .. est, 8, 20, YELLOW)
+    screen.text("共" .. buffon.n, 152, 20, DIM)
+    screen.text("真值 3.1416", 8, 38, DIM)
+    screen.text("交" .. buffon.c, 152, 38, DIM)
+
+    local mode_txt = (buffon.knob == 1) and ("旋钮 针长 " .. L) or ("旋钮 线距 " .. D)
+    screen.text(mode_txt, 8, 190, YELLOW)
+    -- 屏上针数封顶后，这里写出“屏上留了几根”，和上面的“共 N 根”对照着看，
+    -- 就知道旧针是被顶掉的，不是统计丢了
+    if buffon.n > #buffon.needles then
+        screen.text("屏" .. #buffon.needles, 144, 190, DIM)
+    end
+    screen.text("↑投1 ↓投10", 8, 206, TEXT)
+    screen.text("←切参数 →换视图", 8, 222, DIM)
+    screen.present()
+end
+
+local function update_buffon(dt)
+    local step = knob_step()
+    if step ~= 0 then
+        if buffon.knob == 1 then
+            local i = buffon.li + step
+            if i < 1 then i = 1 elseif i > #BF_L then i = #BF_L end
+            -- 针不能比线距长（否则一根针可能同时扎两条线，这个公式就不成立了）
+            while i > 1 and BF_L[i] > BF_D[buffon.di] do i = i - 1 end
+            if i ~= buffon.li then
+                buffon.li = i
+                buffon_reset()          -- 换 L/D 就是换实验，统计清零才诚实
+                play_sfx("move", 40)
+            end
+        else
+            local i = buffon.di + step
+            if i < 1 then i = 1 elseif i > #BF_D then i = #BF_D end
+            if i ~= buffon.di then
+                buffon.di = i
+                while buffon.li > 1 and BF_L[buffon.li] > BF_D[i] do buffon.li = buffon.li - 1 end
+                buffon_reset()
+                play_sfx("move", 40)
+            end
+        end
+    end
+    if pressed("up") then buffon_throw(1) end
+    if pressed("down") then buffon_throw(10) end
+    if pressed("left") then
+        buffon.knob = 3 - buffon.knob
+        play_sfx("select", 0)
+    end
+    if pressed("right") then
+        -- 平行线与针 <-> 圆周率收敛曲线；统计不清零，两个视图看的是同一批针
+        buffon.view = 3 - buffon.view
+        play_sfx("move", 40)
+    end
+    draw_buffon()
+end
+
+SCENES.buffon = { init = init_buffon, update = update_buffon, draw = draw_buffon }
+
 -- ================= 概率实验室：蒙提霍尔（三门问题） =================
+-- 规则要一眼看懂，所以整局都把三扇门摊在屏幕上：
+--   1) 你选一扇（旋钮选，右键确认）
+--   2) 主持人知道车在哪，会打开一扇你没选的羊门
+--   3) 你决定换门还是坚持，然后全部门打开
+-- 关键在于第 2 步不是随机的：他一定开羊门，所以剩下那扇门的胜率是 2/3。
 local monty = {
-    state = "choose", sel = 1, car = 1, revealed = 0,
+    state = "choose", sel = 1, car = 1, revealed = 0, final = 1,
     swapped = false, win = false,
     sw_wins = 0, sw_total = 0, st_wins = 0, st_total = 0,
 }
@@ -1163,6 +1556,7 @@ local function init_monty()
     monty.sel = 1
     monty.car = rnd_int(3)
     monty.revealed = 0
+    monty.final = 1
     monty.swapped = false
     monty.win = false
 end
@@ -1173,16 +1567,14 @@ local function monty_reveal()
         if d ~= monty.sel and d ~= monty.car then opts[#opts + 1] = d end
     end
     monty.revealed = opts[rnd_int(#opts)]
+    monty.final = monty.sel
     monty.state = "decide"
     play_sfx("select", 0)
 end
 
-local function draw_door(d, x, color)
-    local y = 40
-    screen.rect(x, y, 56, 110, color)
-    screen.rect(x + 4, y + 4, 48, 106, 0x1B263D)
-    screen.rect(x + 40, y + 54, 5, 5, 0xE8ECF3)
-    screen.text(tostring(d), x + 24, y + 118, TEXT)
+local function monty_stat(w, t)
+    if t <= 0 then return w .. "/" .. t end
+    return w .. "/" .. t .. " " .. math.floor(w * 100 / t + 0.5) .. "%"
 end
 
 local function draw_monty()
@@ -1190,34 +1582,48 @@ local function draw_monty()
     for i = 1, 6 do
         screen.rect(0, (i - 1) * 40, W, 40, BG_GRAD[i])
     end
-    screen.text("蒙提霍尔", 88, 2, TITLE)
+    screen.text("蒙提霍尔", 8, 2, TITLE)
     hint_back(164, 2)
+
     for d = 1, 3 do
-        local x = 16 + (d - 1) * 72
+        local x = 12 + (d - 1) * 74
+        -- 关着 = 灰；你选中的 = 蓝；主持人打开的羊门 = 暗；结果页全开
         local color = 0x5A6478
-        if d == monty.car then color = YELLOW
-        elseif d == monty.revealed then color = 0x3A4A66 end
         if monty.state == "choose" and d == monty.sel then color = BLUE end
-        draw_door(d, x, color)
-    end
-    if monty.state == "choose" then
-        screen.text("旋钮选门 →确认", 62, 168, TEXT)
-    elseif monty.state == "decide" then
-        screen.text("换门↑  坚持↓", 68, 168, TEXT)
-    elseif monty.state == "result" then
-        local msg = "开门 " .. monty.revealed .. " 是羊"
-        screen.text(msg, 72, 168, TEXT)
-        if monty.win then
-            screen.text("你赢了！", 92, 188, YELLOW)
-        else
-            screen.text("你输了（车在" .. monty.car .. "）", 64, 188, RED)
+        if monty.state == "result" or (monty.state == "decide" and d == monty.revealed) then
+            color = 0x3A4A66
         end
-        screen.text("→ 再来一局", 74, 208, DIM)
+        screen.rect(x, 36, 64, 88, color)
+        screen.rect(x + 5, 41, 54, 78, 0x1B263D)
+        screen.rect(x + 46, 96, 6, 6, 0xE8ECF3)          -- 门把手
+        local shown = (monty.state == "result") or (monty.state == "decide" and d == monty.revealed)
+        if shown then
+            local is_car = (d == monty.car)
+            screen.text(is_car and "车" or "羊", x + 24, 70, is_car and YELLOW or DIM)
+        end
+        screen.text(tostring(d), x + 24, 128, TEXT)
     end
-    local swp = "换 " .. monty.sw_wins .. "/" .. monty.sw_total
-    local stp = "坚持 " .. monty.st_wins .. "/" .. monty.st_total
-    screen.text(swp, 24, 222, BLUE)
-    screen.text(stp, 130, 222, GREEN)
+
+    if monty.state == "choose" then
+        screen.text("一扇门后有车，先选一扇", 8, 152, TEXT)
+        screen.text("旋钮选门   →确认", 8, 174, TEXT)
+    elseif monty.state == "decide" then
+        screen.text("主持人开了 " .. monty.revealed .. " 号：是羊", 8, 152, TEXT)
+        screen.text("换门↑   坚持↓", 8, 174, TEXT)
+        screen.text("换门赢的概率是 2/3", 8, 194, YELLOW)
+    else
+        local pick = "你" .. (monty.swapped and "换到 " or "守住 ") .. monty.final .. " 号"
+        screen.text(pick, 8, 152, TEXT)
+        if monty.win then
+            screen.text("门后是车，赢了！", 8, 172, YELLOW)
+        else
+            screen.text("门后是羊，输了", 8, 172, RED)
+        end
+        screen.text("→ 再来一局", 8, 194, DIM)
+    end
+
+    screen.text("换 " .. monty_stat(monty.sw_wins, monty.sw_total), 8, 216, BLUE)
+    screen.text("守 " .. monty_stat(monty.st_wins, monty.st_total), 124, 216, GREEN)
     screen.present()
 end
 
@@ -1250,6 +1656,7 @@ local function update_monty(dt)
                 monty.st_total = monty.st_total + 1
                 if final_door == monty.car then monty.st_wins = monty.st_wins + 1 end
             end
+            monty.final = final_door
             monty.win = (final_door == monty.car)
             monty.state = "result"
             play_sfx(monty.win and "win" or "fail", 0)
@@ -1535,6 +1942,11 @@ function on_start()
     last_ms = nil
     now_ms = 0
     sfx_last = {}
+    intro_id = 0
+    intro_pending = nil
+    intro_busy = false
+    intro_until = 0
+    intro_timeouts = 0
     set_scene("menu")
 end
 
@@ -1560,13 +1972,29 @@ function on_tick(dt)
     if s and s.update then s.update(step_dt) end
 
     now_ms = now_ms + step_dt       -- 音效节流用（clock.ms 只在调试固件里有）
+
+    -- 讲解队列：一次只跑一条，等上一条交付结果再念下一条
+    if intro_busy and now_ms > intro_deadline then
+        -- 回调丢了（设备的语音服务偶尔会卡住不回包）。必须主动取消这一条：
+        -- 否则音频通道一直被它占着，synth.play 全部失败 —— 整个游戏就哑了。
+        if intro_id ~= 0 and tts and tts.cancel then
+            if pcall then pcall(tts.cancel, intro_id) else tts.cancel(intro_id) end
+        end
+        intro_id = 0
+        intro_busy = false
+        intro_until = 0
+        intro_timeouts = intro_timeouts + 1
+    end
+    -- 连续两次都没回包，就当这台机器的语音服务不可用：
+    -- 本次运行不再念，免得每进一个游戏都要卡 20 秒静音
+    if intro_pending ~= nil and not intro_busy and intro_timeouts < 2 then intro_flush() end
 end
 
 -- 侧键返回的层级关系：概率实验室里的游戏退到二级菜单，其余退到主菜单
 local PARENT = {
     prob_menu = "menu",
     dice = "prob_menu", coin = "prob_menu", galton = "prob_menu",
-    converge = "prob_menu", monty = "prob_menu", binom = "prob_menu",
+    converge = "prob_menu", buffon = "prob_menu", monty = "prob_menu", binom = "prob_menu",
     snake = "menu", balance = "menu", target = "menu", g2048 = "menu",
 }
 

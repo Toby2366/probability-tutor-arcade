@@ -62,6 +62,23 @@ adc = { read = function(ch) return SIM.knob end }
 buzzer = { play = function() end }
 clock = { ms = function() return SIM.t end, now = function() return 0 end }
 app = { width = 240, height = 240, exit = function() SIM.exited = true end }
+-- tts.speak：C 侧要求 1..512 字节纯文本，成功返回播报 id；结果走 on_tts_result 回调。
+SIM.tts_texts, SIM.tts_next = {}, 0
+tts = {
+  speak = function(text)
+    if type(text) ~= "string" then error("tts.speak: text must be a string") end
+    local n = #text
+    if n < 1 or n > 512 then error("tts.speak: text must be 1..512 bytes (got " .. n .. ")") end
+    SIM.tts_next = SIM.tts_next + 1
+    SIM.tts_texts[#SIM.tts_texts + 1] = text
+    -- SIM.tts_silent = 设备语音服务卡死：请求接受了但永远不回包
+    if SIM.tts_silent then return SIM.tts_next end
+    -- 真机上播报是异步的：这里标记 6 秒后交付结果，由 driver 的 tick 触发回调
+    SIM.tts_pending, SIM.tts_done_at = SIM.tts_next, SIM.t + 6000
+    return SIM.tts_next
+  end,
+  cancel = function(id) return true end,
+}
 
 -- synth.play 的严格复刻：C 侧对每个 note 做 luaL_checkinteger + 范围校验，
 -- 同一 voice 上的音符排序后不能重叠，否则直接抛错（真机上就是整个安装失败）。
@@ -113,10 +130,28 @@ local t = 0
 local function tick(dt)
   SIM.t = t
   on_tick(dt or 20)
+  if SIM.tts_pending and t >= SIM.tts_done_at then
+    local id = SIM.tts_pending
+    SIM.tts_pending = nil
+    if on_tts_result then on_tts_result(id, { status = "completed" }) end
+  end
 end
+-- 逻辑方向 -> 物理引脚（2026-11 实测：上=PB7 下=PA0 左=PB6 右=PA1）
+local PIN = { up = "b7", down = "a0", left = "b6", right = "a1" }
 local function tap(key)
-  SIM.keys[key] = 1; t = t + 20; tick()
-  SIM.keys[key] = 0; t = t + 20; tick()
+  local k = PIN[key] or key
+  SIM.keys[k] = 1; t = t + 20; tick()
+  SIM.keys[k] = 0; t = t + 20; tick()
+end
+local function prob_item(i)
+  on_start(); t = 0; tick()
+  tap("down"); tap("right")
+  for _ = 2, i do tap("down") end
+  tap("right")
+end
+local function wait_ms(ms)
+  local left = ms
+  while left > 0 do t = t + 120; tick(); left = left - 120 end
 end
 local function title()
   return SIM.texts[1] and SIM.texts[1].s or "?"
@@ -141,19 +176,16 @@ print("[菜单] 首屏标题=" .. title() .. " 返回提示=" .. tostring(back_h
 local names = { "贪吃蛇", "概率实验室", "平衡挑战", "打靶", "2048" }
 for i, want in ipairs(names) do
   on_start(); t = 0; tick()
-  for _ = 2, i do tap("b7") end          -- 下移到第 i 项
-  tap("b6")                              -- 进入
+  for _ = 2, i do tap("down") end          -- 下移到第 i 项
+  tap("right")                              -- 进入
   if i <= 4 then tick() end
   local h = back_hint()
   print(string.format("[%s] 标题=%s 返回提示=%s", want, title(), h and h.s or "缺失!"))
 end
 
 -- 概率实验室六个子项
-for i = 1, 6 do
-  on_start(); t = 0; tick()
-  tap("b7"); tap("b6")
-  for _ = 2, i do tap("b7") end
-  tap("b6")
+for i = 1, 7 do
+  prob_item(i)
   tick()
   local h = back_hint()
   print(string.format("[概率-%d] 标题=%s 返回提示=%s", i, title(), h and h.s or "缺失!"))
@@ -162,7 +194,7 @@ end
 -- 平衡挑战：1) 旋钮打两端不能崩（原来 180.0 这种浮点直接抛错）
 --           2) 什么都不做能撑多久 3) 反向修正能否救回来
 on_start(); t = 0; tick()
-tap("b7"); tap("b7"); tap("b6")
+tap("down"); tap("down"); tap("right")
 for _, kk in ipairs({ 0, 512, 1023, 300, 800 }) do
   SIM.knob = kk
   for _ = 1, 5 do t = t + 20; tick() end
@@ -171,7 +203,7 @@ print("[平衡] 旋钮 0/512/1023 各跑 5 帧 => 无异常, 标题=" .. title()
 
 local function run_balance(knob_fn, max_s)
   on_start(); t = 0; tick()
-  tap("b7"); tap("b7"); tap("b6")
+  tap("down"); tap("down"); tap("right")
   local ms, ball_x = 0, nil
   for i = 1, max_s * 50 do
     SIM.knob = knob_fn(ball_x)
@@ -197,7 +229,7 @@ print(string.format("[平衡] 比例修正存活 %.1fs 末位置=%s", alive, tos
 
 -- 打靶：每发准星要重新随机
 on_start(); t = 0; tick()
-tap("b7"); tap("b7"); tap("b7"); tap("b6")   -- 第 4 项 = 打靶
+tap("down"); tap("down"); tap("down"); tap("right")   -- 第 4 项 = 打靶
 local function crosshair()
   for _, s in ipairs(SIM.shapes) do
     if s.c == 0xF4C64A and s.k == "rect" and s.w == 2 and s.h == 12 then return s.x + 1 end
@@ -215,10 +247,10 @@ local aims, holes = {}, {}
 for shot = 1, 5 do
   tick()
   aims[#aims + 1] = crosshair()
-  tap("b6")            -- 发射
+  tap("right")            -- 发射
   tick()
   holes[#holes + 1] = hole()
-  tap("b6")            -- 下一发
+  tap("right")            -- 下一发
 end
 local same, maxdev = 0, 0
 for i = 2, #aims do if aims[i] == aims[i - 1] then same = same + 1 end end
@@ -231,7 +263,7 @@ print("[打靶] 五发准星 x = " .. table.concat(aims, ",") .. "  相邻相同
 
 -- 瞄准靶心再打：环数应该很高
 on_start(); t = 0; tick()
-tap("b7"); tap("b7"); tap("b7"); tap("b6")
+tap("down"); tap("down"); tap("down"); tap("right")
 tick()
 local kk = 512
 for i = 1, 200 do
@@ -244,7 +276,7 @@ for i = 1, 200 do
   t = t + 20; tick()
 end
 local cx = crosshair()
-tap("b6"); tick()
+tap("right"); tick()
 local ring_txt = ""
 for _, x in ipairs(SIM.texts) do
   if x.s:find("环", 1, true) and #x.s <= 6 then ring_txt = x.s end
@@ -253,8 +285,8 @@ print("[打靶] 瞄到 x=" .. tostring(cx) .. " 后命中 " .. ring_txt .. "（�
 
 -- 2048：连续按方向键，看分数与文字数是否健康
 on_start(); t = 0; tick()
-for _ = 2, 5 do tap("b7") end
-tap("b6")
+for _ = 2, 5 do tap("down") end
+tap("right")
 tick()
 local dirs = { "a1", "a0", "b6", "b7" }
 local maxtext = 0
@@ -286,20 +318,22 @@ local function stress(label, nav)
   end)
   print(string.format("[压力] %-8s %s", label, ok and "OK" or ("抛错: " .. tostring(err))))
 end
-stress("贪吃蛇", function() tap("b6"); tap("b6") end)
-stress("掷骰子", function() tap("b7"); tap("b6"); tap("b6") end)
-stress("掷硬币", function() tap("b7"); tap("b6"); tap("b7"); tap("b6") end)
-stress("高尔顿", function() tap("b7"); tap("b6"); tap("b7"); tap("b7"); tap("b6") end)
-stress("频率收敛", function() tap("b7"); tap("b6"); tap("b7"); tap("b7"); tap("b7"); tap("b6") end)
-stress("蒙提霍尔", function() tap("b7"); tap("b6"); tap("b7"); tap("b7"); tap("b7"); tap("b7"); tap("b6") end)
-stress("二项分布", function() tap("b7"); tap("b6"); tap("b7"); tap("b7"); tap("b7"); tap("b7"); tap("b7"); tap("b6") end)
-stress("平衡挑战", function() tap("b7"); tap("b7"); tap("b6") end)
-stress("打靶", function() tap("b7"); tap("b7"); tap("b7"); tap("b6") end)
-stress("2048", function() tap("b7"); tap("b7"); tap("b7"); tap("b7"); tap("b6") end)
+stress("贪吃蛇", function() tap("right"); tap("right") end)
+stress("掷骰子", function() prob_item(1) end)
+stress("掷硬币", function() prob_item(2) end)
+stress("高尔顿", function() prob_item(3) end)
+stress("频率收敛", function() prob_item(4) end)
+stress("蒲丰投针", function() prob_item(5) end)
+stress("蒙提霍尔", function() prob_item(6) end)
+stress("二项分布", function() prob_item(7) end)
+stress("平衡挑战", function() tap("down"); tap("down"); tap("right") end)
+stress("打靶", function() tap("down"); tap("down"); tap("down"); tap("right") end)
+stress("2048", function() tap("down"); tap("down"); tap("down"); tap("down"); tap("right") end)
 
 -- 骰子：按 → 后要有 830ms 的抖动滚动（点数乱跳 + 方块位移），然后落定计入统计
 on_start(); t = 0; tick()
-tap("b7"); tap("b6"); tap("b6")          -- 主菜单 -> 概率实验室 -> 掷骰子
+tap("down"); tap("right"); tap("right")          -- 主菜单 -> 概率实验室 -> 掷骰子
+wait_ms(12000)                           -- 讲解期间音效静音，先让讲解"播完"
 local function dice_box()
   for _, s in ipairs(SIM.shapes) do
     if s.k == "rect" and s.w == 80 and s.h == 80 then return s end
@@ -307,7 +341,7 @@ local function dice_box()
 end
 local sfx0 = SIM.sfx_calls
 t = t + 20; tick()
-tap("b6")                                 -- 掷
+tap("right")                                 -- 掷
 local frames, xs = 0, {}
 for i = 1, 80 do
   t = t + 20; tick()
@@ -337,9 +371,135 @@ if _SFX_DUMP then
   print(string.format("[音效] %d 组乐谱全部过校验，非法 %d 组", #names, bad))
 end
 
--- 侧键返回：主菜单 -> 退出；游戏内 -> 回到上一级
+-- 蒲丰投针：默认就是"平行线与针"视图（俯视），逐根核对"红=确实穿过某条线"，并读圆周率估计
+prob_item(5)
+tick()
+local function line_ys()
+  local ys = {}
+  for _, sh in ipairs(SIM.shapes) do
+    if sh.k == "line" and sh.c == 0x3A4A66 and sh.y1 == sh.y2 then ys[#ys + 1] = sh.y1 end
+  end
+  return ys
+end
+local function needle_check()
+  local ys = line_ys()
+  local red, blue, redMis, blueMis, worst = 0, 0, 0, 0, 0
+  for _, sh in ipairs(SIM.shapes) do
+    if sh.k == "line" and (sh.c == 0xFF6B5E or sh.c == 0x4A90E2) then
+      local lo, hi = math.min(sh.y1, sh.y2), math.max(sh.y1, sh.y2)
+      local hit, nearest = false, 99
+      for _, y in ipairs(ys) do
+        if y >= lo and y <= hi then hit = true end
+        local d = math.min(math.abs(y - lo), math.abs(y - hi))
+        if d < nearest then nearest = d end
+      end
+      if sh.c == 0xFF6B5E then
+        red = red + 1
+        if not hit then redMis = redMis + 1 end      -- 红却看不出相交 = 真 bug
+      else
+        blue = blue + 1
+        if hit then                                   -- 蓝却碰到线 = 取整擦边
+          blueMis = blueMis + 1
+          if nearest > worst then worst = nearest end
+        end
+      end
+    end
+  end
+  return red, blue, redMis, blueMis, #ys, worst
+end
+local r, b, rmis, bmis, nl, w1 = needle_check()
+print(string.format("[蒲丰] 入场 %d 根：红 %d 蓝 %d，线 %d 条；红针误判 %d，蓝针擦边 %d",
+  r + b, r, b, nl, rmis, bmis))
+for _ = 1, 3 do tap("down") end          -- 再投 30 根
+tick()
+local w2
+r, b, rmis, bmis, nl, w2 = needle_check()
+local est = ""
+for _, x in ipairs(SIM.texts) do
+  if x.s:find("圆周率", 1, true) then est = x.s end
+end
+print(string.format("[蒲丰] 共 %d 根：红 %d 蓝 %d，红针误判 %d，蓝针擦边 %d（<=%.1fpx），%s",
+  r + b, r, b, rmis, bmis, w2, est))
+
+-- 视图切换：→ 应换成圆周率收敛曲线（折线 + 3.1416 黄色参考线），再按一次切回针板
+tap("right"); tick()
+local seg, ref, refy = 0, 0, 0
+for _, s in ipairs(SIM.shapes) do
+  if s.k == "line" and s.c == 0x4A90E2 then seg = seg + 1 end
+  if s.k == "rect" and s.c == 0xF4C64A and s.h == 1 then ref = ref + 1; refy = s.y end
+end
+print(string.format("[蒲丰] 曲线视图：折线 %d 段，真值参考线 %d 条 y=%d", seg, ref, refy))
+
+-- 大数定律：投到 1000 根左右，曲线末端应明显贴近 3.1416 那条参考线
+for _ = 1, 100 do tap("down") end
+tick()
+local lasty, dot = nil, 0
+for _, s in ipairs(SIM.shapes) do
+  if s.k == "line" and s.c == 0x4A90E2 then lasty = s.y2 end
+  if s.k == "rect" and s.c == 0xFF6B5E and s.w == 3 then dot = dot + 1 end
+end
+local estv = ""
+for _, x in ipairs(SIM.texts) do
+  if x.s:find("圆周率", 1, true) then estv = x.s end
+end
+print(string.format("[蒲丰] 投满 1000 根：%s，曲线末点 y=%s（参考线 %d），末点标记 %d 个",
+  estv, tostring(lasty), refy, dot))
+tap("right"); tick()
+local nd = 0
+for _, s in ipairs(SIM.shapes) do
+  if s.k == "line" and (s.c == 0xFF6B5E or s.c == 0x4A90E2) then nd = nd + 1 end
+end
+local total_txt, scr_txt = "", ""
+for _, x in ipairs(SIM.texts) do
+  if x.s:find("共", 1, true) then total_txt = x.s end
+  if x.s:sub(1, 3) == "屏" then scr_txt = x.s end
+end
+print(string.format("[蒲丰] 切回针板视图：屏上 %d 根（上限 160），%s，%s", nd, total_txt, scr_txt))
+if nd > 160 then error("屏上针数超出一帧预算：" .. nd) end
+if total_txt == "" then error("没显示总投针数，玩家会以为针丢了") end
+
+-- 讲解期间音效应静音（"嘟嘟"声会盖住人声）
+prob_item(1)
+tick()
+local s0 = SIM.sfx_calls
+tap("right")
+tick()
+print("[讲解] 掷骰子时音效增量 = " .. (SIM.sfx_calls - s0) .. "（讲解中应为 0）")
+
+-- 进场讲解：每进一个游戏都应调一次 tts.speak
+SIM.tts_texts = {}
 on_start(); t = 0; tick()
-tap("b7"); tap("b6"); tick()        -- 进概率实验室
+tap("right")
+print("[讲解] 进贪吃蛇触发 " .. #SIM.tts_texts .. " 段：" .. (SIM.tts_texts[1] or "无"))
+
+-- 语音服务不回包时必须自愈：20s 后放开队列、音效恢复，
+-- 否则 TTS 会一直占着音频通道，整个游戏静音（真机踩过）。
+-- dt 会被 clamp 到 120ms（掉帧保护），所以按 120ms 走 200 帧 ≈ 24 秒
+SIM.tts_silent = true
+SIM.tts_texts = {}
+on_start(); t = 0; tick()
+tap("right")                                          -- 贪吃蛇：第 1 次请求
+for _ = 1, 200 do t = t + 120; tick(120) end
+local sfx0 = SIM.sfx_calls
+tap("down")                                           -- 转向，应已恢复音效
+print("[讲解] 不回包 24s 后音效增量 = " .. (SIM.sfx_calls - sfx0) .. "（应 >0，说明已自愈）")
+
+-- 连续两次不回包就当语音服务不可用，第三次进游戏不该再发请求
+on_button_click("function"); tick()
+tap("down"); tap("down"); tap("down"); tap("right")    -- 打靶：第 2 次请求
+for _ = 1, 200 do t = t + 120; tick(120) end
+on_button_click("function"); tick()
+tap("down"); tap("down"); tap("down"); tap("down"); tap("right")   -- 2048：不该再请求
+tick()
+print("[讲解] 连续不回包后第 3 次进游戏，累计请求 " .. #SIM.tts_texts .. " 段（应为 2）")
+SIM.tts_silent = false
+
+-- 侧键返回：主菜单 -> 退出；游戏内 -> 回到上一级
+prob_item(5)                              -- 蒲丰投针 -> 侧键应回概率实验室
+on_button_click("function"); tick()
+print("[侧键] 蒲丰投针 -> 标题=" .. title())
+on_start(); t = 0; tick()
+tap("down"); tap("right"); tick()        -- 进概率实验室
 on_button_click("function"); tick()
 print("[侧键] 概率实验室 -> 标题=" .. title())
 on_button_click("function"); tick()

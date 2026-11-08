@@ -35,10 +35,10 @@ index ecaf7785..07fdeb12 100644
  typedef struct {
 diff --git a/apps/arcs-mini/mcp-tools/mcp_tool_miniapp_builtin.c b/apps/arcs-mini/mcp-tools/mcp_tool_miniapp_builtin.c
 new file mode 100644
-index 00000000..8d01bd95
+index 00000000..9c9eedcc
 --- /dev/null
 +++ b/apps/arcs-mini/mcp-tools/mcp_tool_miniapp_builtin.c
-@@ -0,0 +1,415 @@
+@@ -0,0 +1,429 @@
 +#include <stdio.h>
 +#include <string.h>
 +
@@ -325,14 +325,15 @@ index 00000000..8d01bd95
 +        }
 +        char bank = 0;
 +        int pin = 0;
++        /* 引脚与丝印方向是交叉的（2026-11 实测）：上=PB7 下=PA0 左=PB6 右=PA1 */
 +        if (strcmp(argv[2], "up") == 0) {
-+            bank = 'a'; pin = 0;
-+        } else if (strcmp(argv[2], "left") == 0) {
-+            bank = 'a'; pin = 1;
-+        } else if (strcmp(argv[2], "right") == 0) {
-+            bank = 'b'; pin = 6;
-+        } else if (strcmp(argv[2], "down") == 0) {
 +            bank = 'b'; pin = 7;
++        } else if (strcmp(argv[2], "left") == 0) {
++            bank = 'b'; pin = 6;
++        } else if (strcmp(argv[2], "right") == 0) {
++            bank = 'a'; pin = 1;
++        } else if (strcmp(argv[2], "down") == 0) {
++            bank = 'a'; pin = 0;
 +        } else {
 +            shellPrint(shell, "unknown key '%s'\r\n", argv[2]);
 +            return -1;
@@ -377,14 +378,24 @@ index 00000000..8d01bd95
 +            shellPrint(shell, "  T[%u] (%d,%d) %06x \"%s\"\r\n", (unsigned)i, t->x, t->y,
 +                       (unsigned)t->color, t->text);
 +        }
-+        uint16_t limit = scene->shape_count < 48 ? scene->shape_count : 48;
-+        for (uint16_t i = 0; i < limit; ++i) {
++        /* 图元多了就"只留尾部"：串口一次只回得到 2~3KB，全量 dump 会被截断，
++         * 而折线图这类逐段绘制的画面，恰恰是末尾几段（收敛的最后位置）最关键。 */
++        uint16_t total = scene->shape_count;
++        uint16_t head = total > 64 ? 0 : total;
++        for (uint16_t i = 0; i < head; ++i) {
 +            const miniapp_shape_t *s = &scene->shapes[i];
 +            shellPrint(shell, "  S[%u] k=%u (%d,%d) %dx%d %06x\r\n", (unsigned)i, s->kind,
 +                       s->x, s->y, s->w, s->h, (unsigned)s->color);
 +        }
-+        if (limit < scene->shape_count) {
-+            shellPrint(shell, "  ... %u more\r\n", (unsigned)(scene->shape_count - limit));
++        uint16_t start = total > head ? (total > head + 32 ? total - 32 : head) : total;
++        if (start > head) {
++            shellPrint(shell, "  ... %u more, 只显示末尾 %u 条 ...\r\n",
++                       (unsigned)start, (unsigned)(total - start));
++        }
++        for (uint16_t i = start; i < total; ++i) {
++            const miniapp_shape_t *s = &scene->shapes[i];
++            shellPrint(shell, "  S[%u] k=%u (%d,%d) %dx%d %06x\r\n", (unsigned)i, s->kind,
++                       s->x, s->y, s->w, s->h, (unsigned)s->color);
 +        }
 +        lisa_mem_free(scene);
 +        return 0;
@@ -411,6 +422,9 @@ index 00000000..8d01bd95
 +                   "synth=%u fail=%u notes=%u last=%u/%ums tones=%u busy=%d\r\n",
 +                   (unsigned)a.synth_played, (unsigned)a.synth_failed, (unsigned)a.synth_notes,
 +                   (unsigned)a.last_notes, (unsigned)a.last_ms, (unsigned)a.tones, a.busy ? 1 : 0);
++        shellPrint(shell, "tts req=%u ok=%u fail=%u last=%u %s\r\n",
++                   (unsigned)a.tts_requests, (unsigned)a.tts_ok, (unsigned)a.tts_failed,
++                   (unsigned)a.tts_last_id, a.tts_last);
 +        return 0;
 +    }
 +
@@ -455,10 +469,18 @@ index 00000000..8d01bd95
 +                     SHELL_CMD_DISABLE_RETURN,
 +                 miniapp, cmd_miniapp, "miniapp list|run|status - launch builtin app from console");
 diff --git a/apps/arcs-mini/miniapp/Kconfig b/apps/arcs-mini/miniapp/Kconfig
-index 318f035e..cd563ce8 100644
+index 318f035e..14a4e593 100644
 --- a/apps/arcs-mini/miniapp/Kconfig
 +++ b/apps/arcs-mini/miniapp/Kconfig
-@@ -26,7 +26,7 @@ config MINIAPP_SOURCE_MAX_BYTES
+@@ -20,13 +20,13 @@ config MINIAPP_ADB_DEBUG
+ 
+ config MINIAPP_SOURCE_MAX_BYTES
+     int "Maximum Lua source bytes"
+-    range 1024 65536
+-    default 65536
++    range 1024 131072
++    default 98304
+ 
  config MINIAPP_HEAP_MAX_BYTES
      int "Maximum heap bytes per Lua VM"
      range 65536 524288
@@ -468,7 +490,7 @@ index 318f035e..cd563ce8 100644
        Replacing an active app temporarily needs two VMs for rollback.
  
 diff --git a/apps/arcs-mini/miniapp/miniapp.h b/apps/arcs-mini/miniapp/miniapp.h
-index 7ec8da1d..aadc5762 100644
+index 7ec8da1d..affdf534 100644
 --- a/apps/arcs-mini/miniapp/miniapp.h
 +++ b/apps/arcs-mini/miniapp/miniapp.h
 @@ -12,14 +12,16 @@
@@ -490,7 +512,7 @@ index 7ec8da1d..aadc5762 100644
  #define MINIAPP_CALLBACK_INSTRUCTION_LIMIT 250000u
  /* Allow occasional response parsing to exceed the tick interval. Runtime
   * statistics discount task preemption; the instruction limit stays bounded. */
-@@ -133,6 +135,21 @@ typedef struct {
+@@ -133,6 +135,26 @@ typedef struct {
      char last_error[128];
  } miniapp_status_t;
  
@@ -505,6 +527,11 @@ index 7ec8da1d..aadc5762 100644
 +    uint32_t last_ms;        /* 最近一段乐谱的时长 */
 +    uint32_t tones;          /* 单音 buzzer.play 次数 */
 +    bool busy;               /* 音频线程当前是否在放 */
++    uint32_t tts_requests;   /* 提交过的播报数 */
++    uint32_t tts_ok;         /* completed 的播报数 */
++    uint32_t tts_failed;     /* failed/interrupted 的播报数 */
++    uint32_t tts_last_id;    /* 最近一条播报 id */
++    char tts_last[24];       /* 最近一条播报状态（completed / failed:busy ...） */
 +} miniapp_audio_status_t;
 +
 +void miniapp_get_audio_status(miniapp_audio_status_t *out);
@@ -512,7 +539,7 @@ index 7ec8da1d..aadc5762 100644
  /* Strings are bounded UTF-8 bytes; identifiers are opaque, never paths. */
  #define MINIAPP_ID_MAX 127
  #define MINIAPP_VERSION_MAX 127
-@@ -153,8 +170,12 @@ typedef struct miniapp_source miniapp_source_t;
+@@ -153,8 +175,12 @@ typedef struct miniapp_source miniapp_source_t;
  miniapp_source_t *miniapp_source_acquire(void);
  void miniapp_source_release(miniapp_source_t *source);
  const char *miniapp_source_data(const miniapp_source_t *source, size_t *size);
@@ -525,7 +552,7 @@ index 7ec8da1d..aadc5762 100644
  bool miniapp_is_active(void);
  int miniapp_button_click(const char *button_id);
  int miniapp_exit(void);
-@@ -178,6 +199,8 @@ int miniapp_ui_init(void);
+@@ -178,6 +204,8 @@ int miniapp_ui_init(void);
  int miniapp_ui_open(void);
  int miniapp_ui_close(void);
  int miniapp_ui_present(const miniapp_scene_t *scene);
@@ -535,7 +562,7 @@ index 7ec8da1d..aadc5762 100644
  void miniapp_runtime_ui_closed(void);
  
 diff --git a/apps/arcs-mini/miniapp/miniapp_runtime.c b/apps/arcs-mini/miniapp/miniapp_runtime.c
-index 1e28ecfd..c1db8318 100644
+index 1e28ecfd..c6022371 100644
 --- a/apps/arcs-mini/miniapp/miniapp_runtime.c
 +++ b/apps/arcs-mini/miniapp/miniapp_runtime.c
 @@ -38,6 +38,10 @@
@@ -576,7 +603,7 @@ index 1e28ecfd..c1db8318 100644
  static miniapp_package_t s_current;
  static volatile bool s_active;
  static volatile bool s_install_busy;
-@@ -178,6 +202,30 @@ static uint32_t s_tts_next_id = 1;
+@@ -178,6 +202,43 @@ static uint32_t s_tts_next_id = 1;
  static uint32_t s_tts_worker_id;
  static miniapp_tts_job_t *s_tts_requests[MINIAPP_TTS_RESULT_SLOTS];
  
@@ -590,6 +617,14 @@ index 1e28ecfd..c1db8318 100644
 +static volatile uint32_t s_audio_tones;
 +static volatile bool s_audio_busy;
 +
++/* TTS telemetry: the intro speech runs through the cloud player, so "Lua 没报错"
++ * says nothing about whether a sentence was actually spoken. */
++static volatile uint32_t s_tts_count;
++static volatile uint32_t s_tts_ok;
++static volatile uint32_t s_tts_failed;
++static volatile uint32_t s_tts_last_id;
++static char s_tts_last_status[24] = "none";
++
 +void miniapp_get_audio_status(miniapp_audio_status_t *out)
 +{
 +    if (!out) return;
@@ -601,13 +636,18 @@ index 1e28ecfd..c1db8318 100644
 +    out->last_ms = s_audio_last_ms;
 +    out->tones = s_audio_tones;
 +    out->busy = s_audio_busy;
++    out->tts_requests = s_tts_count;
++    out->tts_ok = s_tts_ok;
++    out->tts_failed = s_tts_failed;
++    out->tts_last_id = s_tts_last_id;
++    snprintf(out->tts_last, sizeof(out->tts_last), "%s", s_tts_last_status);
 +    taskEXIT_CRITICAL();
 +}
 +
  #ifdef CONFIG_MINIAPP_ADB_DEBUG
  struct miniapp_source {
      unsigned refs;
-@@ -408,6 +456,174 @@ static int miniapp_lua_screen_present(lua_State *L)
+@@ -408,6 +469,174 @@ static int miniapp_lua_screen_present(lua_State *L)
      return 0;
  }
  
@@ -782,7 +822,15 @@ index 1e28ecfd..c1db8318 100644
  static int miniapp_lua_led_on(lua_State *L)
  {
      if (strcmp(luaL_checkstring(L, 1), "status") != 0) {
-@@ -767,6 +983,7 @@ static void miniapp_synth_play_score(const miniapp_buzzer_command_t *command)
+@@ -679,6 +908,7 @@ static int miniapp_lua_tts_speak(lua_State *L)
+             job->complete = true;
+         }
+     }
++    ++s_tts_count;
+     lua_pushinteger(L, speech_id);
+     return 1;
+ }
+@@ -767,6 +997,7 @@ static void miniapp_synth_play_score(const miniapp_buzzer_command_t *command)
      int16_t pcm[1024]; /* 64 ms; no full-song PCM allocation. */
      uint32_t resume_sample = 0;
      int result = APP_PLAYER_OK;
@@ -790,7 +838,7 @@ index 1e28ecfd..c1db8318 100644
      miniapp_synth_init(&synth);
  #ifdef CONFIG_APP_PLAYER_AUDIO_FOCUS
      app_player_register_focus_cb(miniapp_player, miniapp_synth_focus, NULL);
-@@ -858,6 +1075,15 @@ static void miniapp_synth_play_score(const miniapp_buzzer_command_t *command)
+@@ -858,6 +1089,15 @@ static void miniapp_synth_play_score(const miniapp_buzzer_command_t *command)
      }
      LISA_LOGI(TAG, "synth finished: notes=%u samples=%u/%u result=%d", command->score->count, synth.cursor,
                command->score->samples, result);
@@ -806,7 +854,7 @@ index 1e28ecfd..c1db8318 100644
  }
  
  static void miniapp_buzzer_task(void *argument)
-@@ -917,6 +1143,7 @@ static void miniapp_buzzer_task(void *argument)
+@@ -917,6 +1157,7 @@ static void miniapp_buzzer_task(void *argument)
              LISA_LOGW(TAG, "failed to play buzzer");
              continue;
          }
@@ -814,7 +862,7 @@ index 1e28ecfd..c1db8318 100644
          TickType_t started = xTaskGetTickCount();
          while (s_active && command.generation == s_buzzer_generation &&
                 !alarm_ring_is_active() && !voice_player_tts_is_active() &&
-@@ -951,6 +1178,13 @@ static int miniapp_lua_clock_now(lua_State *L)
+@@ -951,6 +1192,13 @@ static int miniapp_lua_clock_now(lua_State *L)
      return 1;
  }
  
@@ -828,7 +876,7 @@ index 1e28ecfd..c1db8318 100644
  static int miniapp_lua_clock_localtime(lua_State *L)
  {
      struct tm calendar;
-@@ -1765,6 +1999,14 @@ static int miniapp_lua_audio_get_state(lua_State *L)
+@@ -1765,6 +2013,14 @@ static int miniapp_lua_audio_get_state(lua_State *L)
      return 1;
  }
  
@@ -843,7 +891,7 @@ index 1e28ecfd..c1db8318 100644
  static void miniapp_open_safe_libraries(lua_State *L)
  {
      static const struct {
-@@ -1818,10 +2060,25 @@ static void miniapp_open_safe_libraries(lua_State *L)
+@@ -1818,10 +2074,25 @@ static void miniapp_open_safe_libraries(lua_State *L)
      miniapp_register_function(L, "buzzer", "play", miniapp_lua_buzzer_play);
  #endif
  
@@ -869,7 +917,7 @@ index 1e28ecfd..c1db8318 100644
      lua_newtable(L);
      lua_setglobal(L, "storage");
      miniapp_register_function(L, "storage", "load", miniapp_lua_storage_load);
-@@ -1859,6 +2116,7 @@ static void miniapp_open_safe_libraries(lua_State *L)
+@@ -1859,6 +2130,7 @@ static void miniapp_open_safe_libraries(lua_State *L)
      lua_pushinteger(L, MINIAPP_API_VERSION);
      lua_setfield(L, -2, "api_version");
      lua_setglobal(L, "app");
@@ -877,6 +925,26 @@ index 1e28ecfd..c1db8318 100644
  }
  
  static void miniapp_hook(lua_State *L, lua_Debug *ar)
+@@ -2109,6 +2381,19 @@ static int miniapp_call_tts_result(lua_State *L, miniapp_vm_t *vm,
+                                    uint32_t speech_id, const char *result, const char *error)
+ {
+     LISA_LOGI(TAG, "TTS result id=%u status=%s error=%s", (unsigned)speech_id, result, error ? error : "");
++    taskENTER_CRITICAL();
++    s_tts_last_id = speech_id;
++    if (error) {
++        snprintf(s_tts_last_status, sizeof(s_tts_last_status), "%s:%s", result, error);
++    } else {
++        snprintf(s_tts_last_status, sizeof(s_tts_last_status), "%s", result);
++    }
++    if (result && !strcmp(result, "completed")) {
++        ++s_tts_ok;
++    } else {
++        ++s_tts_failed;
++    }
++    taskEXIT_CRITICAL();
+     miniapp_callback_t call = {
+         .name = "on_tts_result",
+         .kind = MINIAPP_CALLBACK_TTS_RESULT,
 diff --git a/apps/arcs-mini/miniapp/miniapp_ui.c b/apps/arcs-mini/miniapp/miniapp_ui.c
 index fc140dbf..4df7d610 100644
 --- a/apps/arcs-mini/miniapp/miniapp_ui.c
